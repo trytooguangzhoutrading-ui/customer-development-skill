@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "customer-development-kit",
+  "version": "1.0.0",
+  "files": {
+    ".github/workflows/validate.yml": "62728300bca5d1d4ebbd46b52a972b229ec34692fbd7ddbee2e2d4e3bcb8e944",
+    ".gitignore": "5b78c4c65bfd461d55709939ebb73e638bbf5eab4f546288fec90fa39cdea59b",
+    "INSTALL.md": "1d58edc86e7ef8abb3f94b5be93172d1d7851ff5f80b704fc77d384f3c9fe912",
+    "LICENSE": "a240ce9287f42fa46075729c7d1a15e00ad37cd6f4e38239d70ac0ec114b676a",
+    "README.md": "ebf24ef31e448b35c75e9d2303e001c280bfb013d2a0fe6b3281433daba91e5f",
+    "VERSION": "59854984853104df5c353e2f681a15fc7924742f9a2e468c29af248dce45ce03",
+    "install.py": "f6f4af74949e306a3c1ba0b9b25e105f3fa436b546d6588b6ac91ae61a8790e1",
+    "skills/customer-development/SKILL.md": "d8673155f291f88c9dad95bce66248508de43e8f5bd0ffd73af1c9ff0472f35c",
+    "skills/customer-development/agents/openai.yaml": "0a766824382a44664d1e7c0ff0232fc599499fbcd3e5f827846e6c41eb64f349",
+    "skills/customer-development/assets/batch-example.json": "5b43a4c635740eb9a06439dc231fd867033b29264bd94e8c4b420fa38013390b",
+    "skills/customer-development/assets/task-defaults.json": "dcfdaf70524da0a1360a5ed700e9ce1629ba87b82480f257c8c4381042dae69d",
+    "skills/customer-development/references/business-rules.md": "800d9e673e5a5781b70605243778d7b4e8f467f0a095ab105045539dd0e74edb",
+    "skills/customer-development/references/collection-playbook.md": "6f63c533f4784ce61540f37f5683d09545a6c8293987cb264d80378537c5a9d1",
+    "skills/customer-development/references/data-contract.md": "f553437566f2704a87cea483c8748b78bd05774d23727ea368ca8b2a222bd938",
+    "skills/customer-development/references/persistence.md": "41ec35f3b038eb49ea1a7724d746bf72843d9c1a042748927b87fd1adf561455",
+    "skills/customer-development/references/regional-profiles.md": "c9e3ce96399e85f10674b14e973be8f0c02e7569fe7b1f21057d4e5bfe2e48ae",
+    "skills/customer-development/references/sources.md": "34c48598451b0fc01923eb1ed9b391848493eb2abfe7cd99771228654f52de4f",
+    "skills/customer-development/scripts/leadkit.py": "bfa0065d6b010f75bfd4841e86b3c9df0b28af1598aec778256d6214690a98ee",
+    "skills/customer-development/scripts/test_leadkit.py": "29744a14a6ff8cd63ea4696724220643a34a2fd98c65b082f30a821ace9d3f7d",
+    "tools/build_release.py": "a076c6dc092bcddf4b4820ffd8daea72c2afadc992de43f00149bae3ad6e1771"
+  }
+}

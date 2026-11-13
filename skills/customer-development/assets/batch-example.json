@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "batch_id": "example-only",
+  "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "task": {
+    "request": "这是虚构结构示例，不是真实客户。实际任务从 snapshot 生成的 batch.json 填写。",
+    "countries": ["测试国"],
+    "products": ["智能眼镜"],
+    "requirements": ["只交付真实读取后可归属的业务入口"],
+    "allow_channel_candidates": false
+  },
+  "sources": [
+    {
+      "source_id": "EXAMPLE-SRC-001",
+      "url": "https://example.invalid/merchant",
+      "title": "虚构来源，仅展示字段结构",
+      "read_at": "2026-11-13T10:00:00+08:00",
+      "level": "search_snippet",
+      "excerpt": "没有实际采集，不可当作真实证据。"
+    }
+  ],
+  "leads": [
+    {
+      "lead_id": "EXAMPLE-001",
+      "name": "虚构结构示例商户",
+      "country": "测试国",
+      "city": "测试城",
+      "address": "未知",
+      "buyer_type": "未知",
+      "status": "candidate",
+      "identity_source_ids": ["EXAMPLE-SRC-001"],
+      "location_source_ids": [],
+      "product_evidence": [],
+      "contacts": [],
+      "reason": "结构示例，不能计入实际采集成果",
+      "unknowns": ["全部事实尚未核验"],
+      "manual_notes": ""
+    }
+  ],
+  "queue": [{"next_action": "实际任务使用真实来源替换示例，禁止把本示例当客户"}],
+  "limitations": ["本文件是完全虚构的格式示例"]
+}
