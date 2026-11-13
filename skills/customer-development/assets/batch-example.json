@@ -1,13 +1,31 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "batch_id": "example-only",
   "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "task": {
     "request": "这是虚构结构示例，不是真实客户。实际任务从 snapshot 生成的 batch.json 填写。",
-    "countries": ["测试国"],
-    "products": ["智能眼镜"],
-    "requirements": ["只交付真实读取后可归属的业务入口"],
-    "allow_channel_candidates": false
+    "countries": [
+      "测试国"
+    ],
+    "products": [
+      "智能眼镜"
+    ],
+    "requirements": [
+      "只交付真实读取后可归属的业务入口"
+    ],
+    "allow_channel_candidates": false,
+    "customer_profile": {
+      "buyer_types": [
+        "批发商",
+        "进口商",
+        "分销商",
+        "当地市场商户",
+        "相关线上商家",
+        "相关零售商"
+      ],
+      "brand_policy": "white_label_required",
+      "supplier_constraints": {}
+    }
   },
   "sources": [
     {
@@ -28,15 +46,45 @@
       "address": "未知",
       "buyer_type": "未知",
       "status": "candidate",
-      "identity_source_ids": ["EXAMPLE-SRC-001"],
+      "identity_source_ids": [
+        "EXAMPLE-SRC-001"
+      ],
       "location_source_ids": [],
       "product_evidence": [],
       "contacts": [],
       "reason": "结构示例，不能计入实际采集成果",
-      "unknowns": ["全部事实尚未核验"],
-      "manual_notes": ""
+      "unknowns": [
+        "全部事实尚未核验"
+      ],
+      "manual_notes": "",
+      "brand_profile": "unknown",
+      "white_label_evidence": [],
+      "buyer_type_source_ids": [],
+      "market_location": "未知"
     }
   ],
-  "queue": [{"next_action": "实际任务使用真实来源替换示例，禁止把本示例当客户"}],
-  "limitations": ["本文件是完全虚构的格式示例"]
+  "queue": [
+    {
+      "next_action": "实际任务使用真实来源替换示例，禁止把本示例当客户"
+    }
+  ],
+  "limitations": [
+    "本文件是完全虚构的格式示例"
+  ],
+  "region_research": [
+    {
+      "country": "测试国",
+      "area": "测试城",
+      "status": "blocked",
+      "checked_at": "2026-11-13T10:00:00+08:00",
+      "languages": [],
+      "markets": [],
+      "communication_channels": [],
+      "ecommerce_platforms": [],
+      "source_ids": [],
+      "limitations": [
+        "完全虚构结构示例，没有实际预研；实际任务须填写真实读取结果。"
+      ]
+    }
+  ]
 }

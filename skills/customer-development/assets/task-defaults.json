@@ -1,10 +1,37 @@
 {
-  "schema_version": 1,
-  "products": ["智能眼镜", "智能手表", "智能手环", "智能戒指", "蓝牙耳机", "蓝牙音响"],
-  "default_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户", "相关线上商家"],
+  "schema_version": 2,
+  "products": [
+    "智能眼镜",
+    "智能手表",
+    "智能手环",
+    "智能戒指",
+    "蓝牙耳机",
+    "蓝牙音响"
+  ],
+  "default_buyer_types": [
+    "批发商",
+    "进口商",
+    "分销商",
+    "当地市场商户",
+    "相关线上商家",
+    "相关零售商"
+  ],
   "default_region": null,
   "employee_output": "xlsx",
   "outreach_enabled": false,
   "allow_channel_candidates": false,
-  "rules_version": "1.0.0"
+  "rules_version": "1.1.0",
+  "brand_policy": "white_label_required",
+  "customer_profile": {
+    "buyer_types": [
+      "批发商",
+      "进口商",
+      "分销商",
+      "当地市场商户",
+      "相关线上商家",
+      "相关零售商"
+    ],
+    "brand_policy": "white_label_required",
+    "supplier_constraints": {}
+  }
 }

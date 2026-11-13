@@ -20,12 +20,18 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PRODUCTS = ["智能眼镜", "智能手表", "智能手环", "智能戒指", "蓝牙耳机", "蓝牙音响"]
 LEVELS = {"current_original", "cached_original", "third_party_original", "search_snippet", "failed_read"}
 STRONG = {"current_original", "cached_original", "third_party_original"}
-CONTACTS = {"phone", "whatsapp", "email", "website", "form", "facebook", "instagram", "telegram", "tiktok", "youtube", "linkedin", "other"}
+CONTACTS = {"phone", "whatsapp", "email", "website", "form", "facebook", "instagram", "telegram", "tiktok", "youtube", "linkedin", "zalo", "chat", "other"}
 PLATFORMS = {"facebook.com", "instagram.com", "t.me", "telegram.me", "youtube.com", "youtu.be", "tiktok.com", "linkedin.com", "wa.me", "whatsapp.com", "google.com", "maps.google.com"}
+BRANDS = {"white_label", "mixed", "brand_owner", "official_store", "brand_exclusive", "unknown"}
+BRAND_LABELS = {"white_label": "白牌经营", "mixed": "品牌／白牌混合经营", "brand_owner": "品牌方", "official_store": "官方品牌店", "brand_exclusive": "品牌专卖店", "unknown": "品牌类型待核"}
+EXCLUDED_BRANDS = {"brand_owner", "official_store", "brand_exclusive"}
+CAPABILITIES = {"wholesale", "import", "distribution", "sales_capacity"}
+CURRENT = {"current_original", "third_party_original"}
+DEFAULT_BUYER_TYPES = ["批发商", "进口商", "分销商", "当地市场商户", "相关线上商家", "相关零售商"]
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -118,7 +124,7 @@ def init_workspace(root):
         require(not any(p.exists() or p.is_symlink() for p in reserved), "init refuses to overwrite an existing project; choose a new workspace")
         for name in ("execution", "research", "outputs"):
             (root / name).mkdir()
-        config = {"schema_version": 1, "products": PRODUCTS, "default_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户", "相关线上商家"], "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "rules_version": VERSION}
+        config = {"schema_version": 1, "products": PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "rules_version": VERSION}
         safe_write(root / "config.json", config)
         master = {"schema_version": 1, "created_at": now(), "updated_at": now(), "leads": {}, "sources": {}, "batches": {}}
         safe_write(root / "execution" / "master.json", master)
@@ -139,7 +145,7 @@ def snapshot(root, batch_id):
         target.mkdir()
         baseline = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "created_at": now(), "lead_ids": sorted(master["leads"])}
         safe_write(target / "snapshot.json", baseline)
-        packet = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRODUCTS, "requirements": [], "allow_channel_candidates": False}, "sources": [], "leads": [], "queue": [], "limitations": []}
+        packet = {"schema_version": 2, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "limitations": []}
         safe_write(target / "batch.json", packet)
     return {"batch_id": batch_id, "base_sha256": sha, "batch_path": str(target / "batch.json"), "snapshot_path": str(target / "snapshot.json")}
 
@@ -164,8 +170,74 @@ def refs(value, label, sources, strong=False, required=True):
         require(any(sources[s]["level"] in STRONG for s in value), "%s requires readable original evidence; a search snippet is insufficient" % label)
 
 
+def iso_time(value, label):
+    nonempty(value, label)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise LeadkitError(label + " must be an ISO timestamp") from exc
+    require(parsed.tzinfo is not None, label + " needs timezone")
+
+
+def validate_regions(regions, sources):
+    require(isinstance(regions, list) and bool(regions), "region_research must record the researched scope, including blocked attempts")
+    for region in regions:
+        require(isinstance(region, dict), "region_research items must be objects")
+        for field in ("country", "area"):
+            nonempty(region.get(field), "region_research." + field)
+        iso_time(region.get("checked_at"), "region_research.checked_at")
+        status = region.get("status")
+        require(status in {"complete", "partial", "blocked"}, "Invalid region_research.status")
+        string_list(region.get("languages"), "region_research.languages")
+        string_list(region.get("limitations"), "region_research.limitations")
+        if status != "blocked":
+            require(bool(region["languages"]) and all(x.strip() for x in region["languages"]), "Researched regions need actual language choices")
+        refs(region.get("source_ids", []), "region_research.source_ids", sources, strong=status != "blocked", required=status != "blocked")
+        incomplete = status != "complete"
+        for field in ("markets", "communication_channels", "ecommerce_platforms"):
+            entries = region.get(field)
+            require(isinstance(entries, list), "region_research." + field + " must be an array")
+            incomplete = incomplete or not entries
+            for entry in entries:
+                require(isinstance(entry, dict), "Regional channel entries must be objects")
+                nonempty(entry.get("name"), "regional channel name")
+                refs(entry.get("source_ids", []), "regional channel source_ids", sources)
+                if field == "markets":
+                    nonempty(entry.get("kind"), "market.kind")
+                    require(entry.get("size") in {"large", "medium", "small", "unknown"}, "Invalid market.size")
+                    refs(entry.get("size_source_ids", []), "market.size_source_ids", sources, strong=entry["size"] != "unknown", required=entry["size"] != "unknown")
+        if incomplete:
+            require(any(x.strip() for x in region["limitations"]), "Partial/blocked research or empty channel lists need explicit limitations")
+
+
+def actionable_contact(contact, sources):
+    if contact.get("status", "active") != "active" or contact.get("reachability", "untested") == "unavailable":
+        return False
+    if not any(sources[x]["level"] in STRONG for x in contact["source_ids"]):
+        return False
+    kind = contact["kind"]
+    if kind == "website":
+        return False
+    if kind in {"phone", "email"}:
+        return True
+    action = "form" if kind == "form" else "message"
+    return (contact.get("action") == action and bool(contact.get("action_evidence", "").strip())
+            and any(sources[x]["level"] in STRONG for x in contact.get("action_source_ids", [])))
+
+
+def derive_priority(lead, sources):
+    if lead["status"] != "main":
+        return "", "未通过正式客户准入，不评级"
+    capability = [x for x in lead.get("capability_evidence", []) if any(sources[s]["level"] in STRONG for s in x["source_ids"])]
+    activity = lead.get("ongoing_activity", {})
+    if capability and any(sources[s]["level"] in CURRENT for s in activity.get("source_ids", [])):
+        ids = sorted({s for x in capability for s in x["source_ids"]} | set(activity["source_ids"]))
+        return "A", "已通过准入；经营能力：%s；持续经营：%s [%s]" % ("；".join(x["detail"] for x in capability), activity["detail"], " ".join(ids))
+    return "B", "已通过产品、白牌、主体、地域、客户类型和联系入口准入；经营能力或持续经营依据尚不齐全，不推定采购规模"
+
+
 def validate_packet(packet, master):
-    require(isinstance(packet, dict) and packet.get("schema_version") == 1, "Expected batch schema_version 1")
+    require(isinstance(packet, dict) and packet.get("schema_version") == 2, "New commits require batch schema_version 2; create a new snapshot and apply v1.1 rules")
     valid_id(packet.get("batch_id"), "batch_id", BATCH_RE)
     require(isinstance(packet.get("base_sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", packet["base_sha256"]), "base_sha256 must come from snapshot")
     task = packet.get("task")
@@ -176,6 +248,12 @@ def validate_packet(packet, master):
     require(bool(task["countries"]), "task.countries needs an explicit scope (use 全球 for global tasks)")
     require(bool(task["products"]) and set(task["products"]) <= set(PRODUCTS), "task.products must select the configured six product classes")
     require(isinstance(task.get("allow_channel_candidates", False), bool), "allow_channel_candidates must be boolean")
+    profile = task.get("customer_profile")
+    require(isinstance(profile, dict), "task.customer_profile is required")
+    string_list(profile.get("buyer_types"), "customer_profile.buyer_types")
+    require(bool(profile["buyer_types"]) and all(x.strip() for x in profile["buyer_types"]), "customer_profile.buyer_types cannot be empty")
+    require(profile.get("brand_policy") == "white_label_required", "customer_profile.brand_policy must be white_label_required")
+    require(isinstance(profile.get("supplier_constraints"), dict), "customer_profile.supplier_constraints must be an object; leave unknown terms unset")
     for field in ("sources", "leads", "queue", "limitations"):
         require(isinstance(packet.get(field), list), field + " must be an array")
     string_list(packet["limitations"], "limitations")
@@ -205,6 +283,7 @@ def validate_packet(packet, master):
         if sid in sources:
             require(source == sources[sid], "Source IDs are immutable; assign a new ID to changed source " + sid)
         sources[sid] = copy.deepcopy(source)
+    validate_regions(packet.get("region_research"), sources)
     seen_leads = set()
     for lead in packet["leads"]:
         require(isinstance(lead, dict), "lead must be an object")
@@ -216,6 +295,15 @@ def validate_packet(packet, master):
             nonempty(lead.get(field), "lead." + field)
         require(lead.get("status") in {"main", "candidate", "excluded"}, "lead.status must be main/candidate/excluded")
         main = lead["status"] == "main"
+        brand = lead.get("brand_profile", "unknown")
+        require(brand in BRANDS, "Invalid brand_profile")
+        if brand in EXCLUDED_BRANDS:
+            require(lead["status"] == "excluded", "Brand owners, official stores and brand-exclusive stores must be excluded")
+        if main:
+            require(brand in {"white_label", "mixed"}, "main needs white_label or mixed brand_profile with evidence")
+            require(any(r["country"] == lead["country"] and r["status"] != "blocked" for r in packet["region_research"]), "main needs non-blocked region_research for its actual country")
+            require(lead.get("buyer_type") in profile["buyer_types"], "main buyer_type must match customer_profile.buyer_types")
+        refs(lead.get("buyer_type_source_ids", []), "buyer_type_source_ids", sources, strong=main, required=main)
         string_list(lead.get("unknowns", []), "lead.unknowns")
         refs(lead.get("identity_source_ids", []), "identity_source_ids", sources, strong=main, required=main)
         refs(lead.get("location_source_ids", []), "location_source_ids", sources, strong=main, required=main)
@@ -223,19 +311,47 @@ def validate_packet(packet, master):
             require(lead["country"] in task["countries"], "main lead country is outside task.countries")
         pe = lead.get("product_evidence", [])
         require(isinstance(pe, list), "product_evidence must be an array")
-        matching = False
+        matching = set()
         for item in pe:
             require(isinstance(item, dict) and item.get("product") in PRODUCTS, "Unknown product class")
             nonempty(item.get("detail"), "product_evidence.detail")
             refs(item.get("source_ids", []), "product_evidence.source_ids", sources)
             if item["product"] in task["products"] and any(sources[x]["level"] in STRONG for x in item["source_ids"]):
-                matching = True
+                matching.add(item["product"])
         channel_exception = bool(task.get("allow_channel_candidates") and lead.get("channel_fit"))
         if channel_exception:
             nonempty(lead["channel_fit"], "channel_fit")
             refs(lead.get("channel_source_ids", []), "channel_source_ids", sources, strong=True)
         if main:
-            require(matching or channel_exception, "main lead needs readable evidence for a requested product, or an explicitly allowed channel exception")
+            require(bool(matching), "main lead needs readable evidence for a requested product; channel candidates stay candidate")
+        white_evidence = lead.get("white_label_evidence", [])
+        require(isinstance(white_evidence, list), "white_label_evidence must be an array")
+        white_products = set()
+        for item in white_evidence:
+            require(isinstance(item, dict) and item.get("product") in PRODUCTS, "Unknown white-label product class")
+            nonempty(item.get("detail"), "white_label_evidence.detail")
+            refs(item.get("source_ids", []), "white_label_evidence.source_ids", sources)
+            if any(sources[x]["level"] in STRONG for x in item["source_ids"]):
+                white_products.add(item["product"])
+        if main:
+            require(bool(matching & white_products), "main needs readable white_label_evidence for the same requested product")
+        capability = lead.get("capability_evidence", [])
+        require(isinstance(capability, list), "capability_evidence must be an array")
+        for item in capability:
+            require(isinstance(item, dict) and item.get("kind") in CAPABILITIES, "Invalid capability_evidence.kind")
+            nonempty(item.get("detail"), "capability_evidence.detail")
+            refs(item.get("source_ids", []), "capability_evidence.source_ids", sources)
+        activity = lead.get("ongoing_activity")
+        if "ongoing_activity" in lead:
+            require(isinstance(activity, dict), "ongoing_activity must be an object")
+            nonempty(activity.get("detail"), "ongoing_activity.detail")
+            refs(activity.get("source_ids", []), "ongoing_activity.source_ids", sources)
+            if activity.get("observed_on") is not None:
+                require(isinstance(activity["observed_on"], str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", activity["observed_on"]), "ongoing_activity.observed_on must be YYYY-MM-DD")
+                try:
+                    datetime.strptime(activity["observed_on"], "%Y-%m-%d")
+                except ValueError as exc:
+                    raise LeadkitError("Invalid ongoing_activity.observed_on") from exc
         contacts = lead.get("contacts", [])
         require(isinstance(contacts, list), "contacts must be an array")
         strong_contact = False
@@ -246,7 +362,14 @@ def validate_packet(packet, master):
             nonempty(contact.get("attribution"), "contact.attribution (explain merchant ownership)")
             require(contact.get("status", "active") in {"active", "historical", "invalid"}, "contact.status must be active/historical/invalid")
             refs(contact.get("source_ids", []), "contact.source_ids", sources)
-            if contact.get("status", "active") == "active" and contact.get("reachability", "untested") != "unavailable" and any(sources[x]["level"] in STRONG for x in contact["source_ids"]):
+            if "action" in contact:
+                require(contact["action"] in {"form", "message", "none"}, "contact.action must be form/message/none")
+                if contact["action"] != "none":
+                    require(contact["kind"] not in {"phone", "email", "website"}, "phone/email use their own entry; website cannot become actionable")
+                    require(contact["action"] == ("form" if contact["kind"] == "form" else "message"), "contact.action does not match kind")
+                    nonempty(contact.get("action_evidence"), "contact.action_evidence")
+            refs(contact.get("action_source_ids", []), "contact.action_source_ids", sources, required=False)
+            if actionable_contact(contact, sources):
                 strong_contact = True
             if contact["kind"] == "whatsapp":
                 refs(contact.get("whatsapp_source_ids", []), "contact.whatsapp_source_ids", sources, strong=main)
@@ -254,7 +377,7 @@ def validate_packet(packet, master):
             if contact.get("reachability", "untested") not in {"untested", "unavailable"}:
                 raise LeadkitError("This collection skill does not test contacts; reachability must be untested/unavailable")
         if main:
-            require(strong_contact, "main lead needs an attributable business entry supported by readable evidence")
+            require(strong_contact, "main lead needs an actionable attributable business entry; bare websites or display-only social profiles are insufficient")
         if "manual_notes" in lead:
             require(isinstance(lead["manual_notes"], str), "manual_notes must be text")
         if lead.get("sales_stage", "未联系") != "未联系":
@@ -375,6 +498,9 @@ def commit(root, packet):
             old = master["leads"].get(incoming["lead_id"])
             lead = copy.deepcopy(old) if old else {}
             lead.update(copy.deepcopy(incoming))
+            # Omitted fields inherit prior facts; that must not reopen a known excluded brand.
+            if lead.get("brand_profile") in EXCLUDED_BRANDS:
+                require(lead["status"] == "excluded", "Merged brand profile is excluded; keep excluded status or explicitly correct brand_profile with evidence")
             if old:
                 history = copy.deepcopy(old.get("history", []))
                 previous = {k: v for k, v in old.items() if k != "history"}
@@ -392,6 +518,9 @@ def commit(root, packet):
                 lead.setdefault("manual_notes", "")
                 lead.setdefault("manual_owner", "")
                 lead["sales_stage"] = "未联系"
+            # Eligibility and priority describe this batch, never silently inherit a prior A.
+            lead["priority"], lead["priority_reason"] = derive_priority(incoming, sources)
+            lead["rules_version"] = VERSION
             lead["updated_at"] = stamp
             lead["last_batch_id"] = bid
             master["leads"][lead["lead_id"]] = lead
@@ -408,7 +537,7 @@ def commit(root, packet):
                 others = {lid for hint in relevant for lid in hint["lead_ids"] if lid != lead["lead_id"]}
                 require(others <= set(review.get("related_lead_ids", [])), "duplicate_review must cover every matched lead ID")
         counts = {status: sum(x["status"] == status for x in packet["leads"]) for status in ("main", "candidate", "excluded")}
-        master["batches"][bid] = {"packet_sha256": fingerprint, "committed_at": stamp, "task": packet["task"], "lead_ids": ids, "source_ids": [s["source_id"] for s in packet["sources"]], "lead_snapshots": [copy.deepcopy(master["leads"][lid]) for lid in ids], "queue": packet["queue"], "limitations": packet["limitations"], "counts": counts, "duplicate_hints": hints}
+        master["batches"][bid] = {"schema_version": 2, "rules_version": VERSION, "region_research": packet["region_research"], "packet_sha256": fingerprint, "committed_at": stamp, "task": packet["task"], "lead_ids": ids, "source_ids": [s["source_id"] for s in packet["sources"]], "lead_snapshots": [copy.deepcopy(master["leads"][lid]) for lid in ids], "queue": packet["queue"], "limitations": packet["limitations"], "counts": counts, "duplicate_hints": hints}
         master["updated_at"] = stamp
         # One authoritative atomic write. No state is split across a ledger and receipt.
         backup_path = backup_master(root, sha)
@@ -523,12 +652,27 @@ def write_xlsx(path, sheets):
 
 
 def lead_source_ids(lead):
-    result = set(lead.get("identity_source_ids", []) + lead.get("location_source_ids", []) + lead.get("channel_source_ids", []))
+    result = set(lead.get("identity_source_ids", []) + lead.get("location_source_ids", []) + lead.get("channel_source_ids", []) + lead.get("buyer_type_source_ids", []))
     for item in lead.get("product_evidence", []):
         result.update(item["source_ids"])
+    for group in ("white_label_evidence", "capability_evidence"):
+        for item in lead.get(group, []):
+            result.update(item.get("source_ids", []))
+    result.update(lead.get("ongoing_activity", {}).get("source_ids", []))
+    result.update(lead.get("duplicate_review", {}).get("source_ids", []))
     for contact in lead.get("contacts", []):
         result.update(contact["source_ids"])
         result.update(contact.get("whatsapp_source_ids", []))
+        result.update(contact.get("action_source_ids", []))
+    return result
+
+
+def regional_source_ids(region):
+    result = set(region.get("source_ids", []))
+    for group in ("markets", "communication_channels", "ecommerce_platforms"):
+        for item in region.get(group, []):
+            result.update(item.get("source_ids", []))
+            result.update(item.get("size_source_ids", []))
     return result
 
 
@@ -537,24 +681,44 @@ def export_batch(root, batch_id, output):
     require(batch_id in master["batches"], "Unknown committed batch")
     batch = master["batches"][batch_id]
     leads = batch["lead_snapshots"]
+    legacy = batch.get("schema_version", 1) < 2
+    if not legacy:
+        leads = sorted(leads, key=lambda x: {"A": 0, "B": 1}.get(x.get("priority"), 2))
     header = ["客户编号", "商户名称", "国家", "城市", "地址／精度", "经营角色", "匹配产品及证据摘要", "公开业务入口", "适配理由", "待核问题", "来源编号", "人工备注"]
-    widths = [18, 28, 16, 18, 34, 22, 52, 52, 42, 42, 28, 32]
+    header += ["品牌经营类型", "白牌经营证据", "所在市场／位置精度", "近期经营依据", "开发优先级", "评级理由"]
+    widths = [18, 28, 16, 18, 34, 22, 52, 52, 42, 42, 28, 32, 22, 52, 34, 52, 18, 60]
     output_rows = {"main": [header], "candidate": [header]}
     for lead in leads:
         if lead["status"] not in output_rows:
             continue
         evidence = "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("product_evidence", []))
         contacts = "\n".join("%s：%s（%s；%s；%s；%s）[%s]" % (x["kind"], x["value"], x["role"], x["attribution"], {"active": "当前采集", "historical": "历史入口", "invalid": "无效入口"}[x.get("status", "active")], "已知不可用" if x.get("reachability") == "unavailable" else "可达未测试", " ".join(x["source_ids"])) for x in lead.get("contacts", []))
-        output_rows[lead["status"]].append([lead["lead_id"], lead["name"], lead["country"], lead.get("city", ""), lead.get("address", "未知"), lead.get("buyer_type", "未知"), evidence or lead.get("channel_fit", "未知"), contacts, lead["reason"], "\n".join(lead.get("unknowns", [])), " ".join(sorted(lead_source_ids(lead))), lead.get("manual_notes", "")])
+        output_rows[lead["status"]].append([lead["lead_id"], lead["name"], lead["country"], lead.get("city", ""), lead.get("address", "未知"), lead.get("buyer_type", "未知"), evidence or lead.get("channel_fit", "未知"), contacts, lead["reason"], "\n".join(lead.get("unknowns", [])), " ".join(sorted(lead_source_ids(lead))), lead.get("manual_notes", ""), BRAND_LABELS.get(lead.get("brand_profile"), "旧版未评估" if legacy else "品牌类型待核"), "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("white_label_evidence", [])), lead.get("market_location", "未明确"), (lead.get("ongoing_activity", {}).get("detail", "未明确") + "；日期：" + lead.get("ongoing_activity", {}).get("observed_on", "未公开") + " [" + " ".join(lead.get("ongoing_activity", {}).get("source_ids", [])) + "]"), "旧版未评级" if legacy else (lead.get("priority") or "未评级"), "历史批次，未按1.1规则重新资格核验" if legacy else lead.get("priority_reason", "未评级")])
     source_rows = [["来源编号", "关联客户", "来源标题", "来源网址", "读取时间", "读取层级", "支持内容", "限制／资料日期"]]
     wanted = set(batch["source_ids"])
     for lead in leads:
         wanted.update(lead_source_ids(lead))
+    for region in batch.get("region_research", []):
+        wanted.update(regional_source_ids(region))
     for sid in sorted(wanted):
         source = master["sources"][sid]
         linked = " ".join(x["lead_id"] for x in leads if sid in lead_source_ids(x))
+        regional_links = ["地区预研：" + r["area"] for r in batch.get("region_research", []) if sid in regional_source_ids(r)]
+        linked = " / ".join([linked] + regional_links).strip(" / ")
         source_rows.append([sid, linked, source["title"], source["url"], source["read_at"], source["level"], source["excerpt"], "\n".join(str(source.get(k, "")) for k in ("limitations", "content_date") if source.get(k))])
     notes = [["项目", "内容"], ["批次编号", batch_id], ["原始需求", batch["task"]["request"]], ["目标国家", "、".join(batch["task"]["countries"])], ["目标产品", "、".join(batch["task"]["products"])], ["本轮结果", "可开发候选 %d；待核 %d；后台排除 %d" % (batch["counts"]["main"], batch["counts"]["candidate"], batch["counts"]["excluded"])], ["结果边界", "可开发客户为符合本次研究条件的候选，不代表采购意愿、采购权限或可达性已确认。本技能未外联。"], ["已知限制", "\n".join(batch["limitations"]) or "无额外记录"], ["接续事项", "\n".join(q["next_action"] for q in batch["queue"]) or "无记录"], ["查重提示", "\n".join("%s：%s，关系待复核，未自动合并" % (h["matching_key"], " / ".join(h["lead_ids"])) for h in batch["duplicate_hints"]) or "无匹配提示"], ["数据时间", batch["committed_at"]]]
+    profile = batch["task"].get("customer_profile", {})
+    notes += [["资格规则版本", batch.get("rules_version", "1.0.0（历史批次未重新核验）")], ["目标客户类型", "、".join(profile.get("buyer_types", [])) or "历史批次未单列"], ["品牌准入", "目标产品白牌经营有据；混合经营须有白牌证据；品牌方／官方店／专卖店排除" if not legacy else "历史规则，未按新门槛复核"], ["优先级说明", "A/B仅为已通过准入候选的研究交接优先级，不是成交概率；无评级不等于低价值。旧批次保留历史资格，不自动晋级。"]]
+    for name, value in profile.get("supplier_constraints", {}).items():
+        notes.append(["供货条件：" + str(name), str(value)])
+    for region in batch.get("region_research", []):
+        notes.append(["地区预研：" + region["area"], "%s；%s；语言：%s；核查时间：%s；限制：%s [%s]" % (region["country"], {"complete": "已完成本次预研", "partial": "部分完成", "blocked": "受阻"}[region["status"]], "、".join(region["languages"]) or "未核", region["checked_at"], "；".join(region["limitations"]) or "无额外记录", " ".join(region["source_ids"]))])
+        for group, label in (("markets", "市场"), ("communication_channels", "通信渠道"), ("ecommerce_platforms", "电商平台")):
+            for item in region[group]:
+                detail = item["name"]
+                if group == "markets":
+                    detail += "；" + item["kind"] + "；规模：" + {"large": "大型", "medium": "中型", "small": "小型", "unknown": "待核"}[item["size"]]
+                notes.append([region["area"] + "／" + label, detail + " [" + " ".join(item["source_ids"] + item.get("size_source_ids", [])) + "]"])
     write_xlsx(output, [("可开发客户", output_rows["main"], widths), ("待核线索", output_rows["candidate"], widths), ("来源证据", source_rows, [18, 24, 34, 62, 28, 24, 80, 50]), ("采集说明", notes, [24, 100])])
     return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": batch["counts"], "sheets": 4}
 

@@ -1,6 +1,6 @@
 interface:
   display_name: "客户自动采集"
-  short_description: "输入地区与产品需求，自动采集海外客户、核验公开联系、去重并交付Excel"
-  default_prompt: "使用 $customer-development 按我的需求自动采集客户，沿用公司规则和历史库，完成核验去重后直接交付Excel，中间仅作简短进度提示。"
+  short_description: "输入地区与产品需求，自动筛选白牌客户、核验联系并按优先级交付Excel"
+  default_prompt: "使用 $customer-development 按我的需求先确认客户画像和当地渠道，采集有目标白牌证据及实际联系入口的商家，沿用历史库核验去重，按A/B优先级直接交付Excel，中间仅作简短进度提示。"
 policy:
   allow_implicit_invocation: true

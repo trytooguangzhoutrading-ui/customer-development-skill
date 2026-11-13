@@ -26,6 +26,9 @@ class LeadkitTests(unittest.TestCase):
         packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"])
         packet["sources"] = [{"source_id": sid, "url": "https://example.invalid/merchant", "title": "虚构测试原文", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "仅测试。虚构商户经营智能眼镜，测试国公开业务电话 +00123456789。"}]
         packet["leads"] = [{"lead_id": lid, "name": "虚构测试商户", "country": "测试国", "city": "测试城", "address": "仅测试地址", "status": "main", "identity_source_ids": [sid], "location_source_ids": [sid], "product_evidence": [{"product": "智能眼镜", "detail": "虚构测试型号", "source_ids": [sid]}], "contacts": [{"kind": "phone", "value": "+00123456789", "role": "商户公开业务电话", "attribution": "虚构商户原文同页", "source_ids": [sid]}], "reason": "仅用于离线测试", "unknowns": ["采购权限未核"], "manual_notes": "人工初始记录"}]
+        packet["sources"].append({"source_id": "REG-" + sid, "url": "https://example.invalid/region", "title": "虚构地区研究", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "虚构测试国使用测试语言，有商户目录；全部虚构。"})
+        packet["region_research"] = [{"country": "测试国", "area": "测试城", "status": "partial", "checked_at": "2026-11-13T10:00:00+08:00", "languages": ["测试语言"], "markets": [], "communication_channels": [], "ecommerce_platforms": [], "source_ids": ["REG-" + sid], "limitations": ["虚构案例未研究市场和平台"]}]
+        packet["leads"][0].update(buyer_type="批发商", buyer_type_source_ids=[sid], brand_profile="white_label", white_label_evidence=[{"product": "智能眼镜", "detail": "虚构来源明确无品牌通用款", "source_ids": [sid]}])
         return packet
 
     def test_init_no_overwrite(self):
@@ -131,6 +134,7 @@ class LeadkitTests(unittest.TestCase):
             kit.commit(self.root, packet)
         contact["whatsapp_source_ids"] = ["SRC-001"]
         contact["whatsapp_evidence"] = "仅虚构测试：原文明示 WhatsApp"
+        contact.update(action="message", action_evidence="虚构页面具有WA联系链接", action_source_ids=["SRC-001"])
         kit.commit(self.root, packet)
 
     def test_requested_product_and_country(self):
@@ -151,6 +155,9 @@ class LeadkitTests(unittest.TestCase):
         packet["task"]["allow_channel_candidates"] = True
         packet["leads"][0]["channel_fit"] = "本次明确接受电子零售新品渠道"
         packet["leads"][0]["channel_source_ids"] = ["SRC-001"]
+        with self.assertRaisesRegex(kit.LeadkitError, "channel candidates"):
+            kit.commit(self.root, packet)
+        packet["leads"][0]["status"] = "candidate"
         kit.commit(self.root, packet)
 
     def test_new_duplicate_is_not_automatically_merged_or_qualified(self):
@@ -231,6 +238,193 @@ class LeadkitTests(unittest.TestCase):
         with self.assertRaisesRegex(kit.LeadkitError, "32767"):
             kit.write_xlsx(output, [("测试", [["A"], ["x" * 32768]], [20])])
         self.assertFalse(output.exists())
+
+    def test_mixed_shop_needs_white_label_evidence(self):
+        packet = self.packet()
+        lead = packet["leads"][0]
+        lead["brand_profile"] = "mixed"
+        lead["white_label_evidence"] = []
+        with self.assertRaisesRegex(kit.LeadkitError, "white_label_evidence"):
+            kit.commit(self.root, packet)
+        lead["white_label_evidence"] = [{"product": "智能眼镜", "detail": "具体无品牌通用款", "source_ids": ["SRC-001"]}]
+        self.assertEqual(kit.commit(self.root, packet)["counts"]["main"], 1)
+
+    def test_white_evidence_must_match_same_requested_product(self):
+        packet = self.packet()
+        packet["task"]["products"] = ["智能眼镜", "智能手表"]
+        packet["leads"][0]["white_label_evidence"][0]["product"] = "智能手表"
+        with self.assertRaisesRegex(kit.LeadkitError, "same requested product"):
+            kit.commit(self.root, packet)
+
+    def test_brand_entities_are_excluded_and_unknown_stays_candidate(self):
+        packet = self.packet()
+        for kind in ("brand_owner", "official_store", "brand_exclusive"):
+            packet["leads"][0]["brand_profile"] = kind
+            for status in ("main", "candidate"):
+                packet["leads"][0]["status"] = status
+                with self.assertRaisesRegex(kit.LeadkitError, "must be excluded"):
+                    kit.commit(self.root, packet)
+        packet["leads"][0].update(brand_profile="unknown", status="main")
+        with self.assertRaisesRegex(kit.LeadkitError, "brand_profile"):
+            kit.commit(self.root, packet)
+        packet["leads"][0]["status"] = "candidate"
+        self.assertEqual(kit.commit(self.root, packet)["counts"]["candidate"], 1)
+
+    def test_bare_website_and_display_only_social_do_not_qualify(self):
+        packet = self.packet()
+        contact = packet["leads"][0]["contacts"][0]
+        for kind in ("website", "facebook", "instagram", "zalo", "chat", "form"):
+            contact.update(kind=kind, value="https://example.invalid/shop")
+            with self.assertRaisesRegex(kit.LeadkitError, "actionable"):
+                kit.commit(self.root, packet)
+        contact.update(kind="form", action="form", action_evidence="实际询价表单", action_source_ids=["SRC-001"])
+        self.assertEqual(kit.commit(self.root, packet)["counts"]["main"], 1)
+
+    def test_website_action_flag_cannot_bypass_contact_gate(self):
+        packet = self.packet()
+        packet["leads"][0]["contacts"][0].update(kind="website", value="https://example.invalid", action="message", action_evidence="凭空写明有联系", action_source_ids=["SRC-001"])
+        with self.assertRaisesRegex(kit.LeadkitError, "website cannot become"):
+            kit.commit(self.root, packet)
+
+    def test_action_requires_readable_evidence_and_matching_kind(self):
+        packet = self.packet()
+        packet["sources"].append(dict(packet["sources"][0], source_id="SNIPPET", level="search_snippet"))
+        contact = packet["leads"][0]["contacts"][0]
+        contact.update(kind="zalo", action="form", action_evidence="Zalo入口", action_source_ids=["SRC-001"])
+        with self.assertRaisesRegex(kit.LeadkitError, "does not match"):
+            kit.commit(self.root, packet)
+        contact.update(action="message", action_source_ids=["SNIPPET"])
+        with self.assertRaisesRegex(kit.LeadkitError, "actionable"):
+            kit.commit(self.root, packet)
+        contact["action_source_ids"] = ["SRC-001"]
+        kit.commit(self.root, packet)
+
+    def test_region_and_buyer_profile_required(self):
+        packet = self.packet()
+        packet["region_research"] = []
+        with self.assertRaisesRegex(kit.LeadkitError, "region_research"):
+            kit.commit(self.root, packet)
+        packet["region_research"] = [{"country": "其他国", "area": "其他城", "status": "blocked", "checked_at": "2026-11-13T10:00:00+08:00", "languages": [], "markets": [], "communication_channels": [], "ecommerce_platforms": [], "source_ids": [], "limitations": ["无法联网"]}]
+        with self.assertRaisesRegex(kit.LeadkitError, "non-blocked"):
+            kit.commit(self.root, packet)
+        packet["leads"] = []
+        self.assertEqual(kit.commit(self.root, packet)["counts"]["main"], 0)
+
+    def test_unknown_market_size_allowed_but_large_needs_evidence(self):
+        packet = self.packet()
+        market = {"name": "虚构市场", "kind": "电子市场", "size": "large", "source_ids": ["SRC-001"]}
+        packet["region_research"][0]["markets"] = [market]
+        with self.assertRaisesRegex(kit.LeadkitError, "size_source_ids"):
+            kit.commit(self.root, packet)
+        market["size"] = "unknown"
+        kit.commit(self.root, packet)
+
+    def test_main_buyer_type_must_have_matching_profile_and_evidence(self):
+        packet = self.packet()
+        packet["task"]["customer_profile"]["buyer_types"] = ["进口商"]
+        with self.assertRaisesRegex(kit.LeadkitError, "buyer_type"):
+            kit.commit(self.root, packet)
+        packet["task"]["customer_profile"]["buyer_types"] = ["批发商"]
+        packet["leads"][0]["buyer_type_source_ids"] = []
+        with self.assertRaisesRegex(kit.LeadkitError, "buyer_type_source_ids"):
+            kit.commit(self.root, packet)
+
+    def test_priority_is_derived_and_does_not_trust_claimed_a(self):
+        packet = self.packet()
+        packet["leads"][0].update(priority="A", priority_reason="伪造高分")
+        kit.commit(self.root, packet)
+        lead = kit.load_master(self.root)[0]["leads"]["TEST-001"]
+        self.assertEqual(lead["priority"], "B")
+        self.assertNotIn("伪造", lead["priority_reason"])
+
+    def test_priority_a_and_export_order_and_downgrade(self):
+        packet = self.packet()
+        high = copy.deepcopy(packet["leads"][0])
+        high.update(lead_id="TEST-002", name="第二虚构商户", capability_evidence=[{"kind": "wholesale", "detail": "有批发业务", "source_ids": ["SRC-001"]}], ongoing_activity={"detail": "本轮实际持续上新", "source_ids": ["SRC-001"], "observed_on": "2026-11-13"})
+        high["contacts"][0]["value"] = "+00123456780"
+        packet["leads"].append(high)
+        kit.commit(self.root, packet)
+        output = self.root / "outputs/priority.xlsx"
+        kit.export_batch(self.root, "round-1", output)
+        with zipfile.ZipFile(output) as z:
+            sheet = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
+            rows = sheet.find(kit.tag("sheetData"))
+            self.assertEqual(rows[1][0].find('.//' + kit.tag('t')).text, "TEST-002")
+            sources = z.read("xl/worksheets/sheet3.xml").decode()
+            self.assertIn("地区预研", sources)
+        second = self.packet("round-2", lid="TEST-002", sid="SRC-002")
+        second["leads"][0].update(name="第二虚构商户", status="candidate")
+        kit.commit(self.root, second)
+        saved = kit.load_master(self.root)[0]["leads"]["TEST-002"]
+        self.assertEqual(saved["priority"], "")
+        self.assertEqual(saved["history"][-1]["priority"], "A")
+
+    def test_cached_activity_cannot_make_priority_a(self):
+        packet = self.packet()
+        packet["sources"].append(dict(packet["sources"][0], source_id="OLD", level="cached_original", limitations="历史缓存"))
+        packet["leads"][0].update(capability_evidence=[{"kind": "distribution", "detail": "有分销业务", "source_ids": ["SRC-001"]}], ongoing_activity={"detail": "旧活动", "source_ids": ["OLD"]})
+        kit.commit(self.root, packet)
+        self.assertEqual(kit.load_master(self.root)[0]["leads"]["TEST-001"]["priority"], "B")
+
+    def test_legacy_schema_new_commit_rejected_old_batch_exportable(self):
+        packet = self.packet()
+        packet["schema_version"] = 1
+        with self.assertRaisesRegex(kit.LeadkitError, "schema_version 2"):
+            kit.commit(self.root, packet)
+        packet["schema_version"] = 2
+        kit.commit(self.root, packet)
+        master, _ = kit.load_master(self.root)
+        batch = master["batches"]["round-1"]
+        for key in ("schema_version", "rules_version", "region_research"):
+            batch.pop(key)
+        for lead in batch["lead_snapshots"]:
+            for key in ("brand_profile", "white_label_evidence", "priority", "priority_reason"):
+                lead.pop(key, None)
+        (self.root / "execution/master.json").write_bytes(kit.encoded(master))
+        before = (self.root / "execution/master.json").read_bytes()
+        output = self.root / "outputs/legacy.xlsx"
+        kit.export_batch(self.root, "round-1", output)
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+        with zipfile.ZipFile(output) as z:
+            self.assertIn("旧版未评级", z.read("xl/worksheets/sheet1.xml").decode())
+
+    def test_null_activity_rejected_without_crashing(self):
+        packet = self.packet()
+        packet["leads"][0]["ongoing_activity"] = None
+        with self.assertRaisesRegex(kit.LeadkitError, "ongoing_activity must be an object"):
+            kit.commit(self.root, packet)
+
+    def test_large_regional_research_exports_as_human_rows(self):
+        packet = self.packet()
+        packet["region_research"][0]["markets"] = [{"name": "虚构市场%d-" % i + "测试" * 50, "kind": "电子批发市场", "size": "unknown", "source_ids": ["SRC-001"]} for i in range(400)]
+        packet["leads"][0]["ongoing_activity"] = {"detail": "虚构经营观察", "observed_on": "2026-11-13", "source_ids": ["SRC-001"]}
+        kit.commit(self.root, packet)
+        output = self.root / "outputs/large-region.xlsx"
+        kit.export_batch(self.root, "round-1", output)
+        with zipfile.ZipFile(output) as z:
+            notes = ET.fromstring(z.read("xl/worksheets/sheet4.xml"))
+            self.assertGreater(len(notes.find(kit.tag("sheetData"))), 400)
+            texts = [n.text or "" for n in notes.findall('.//' + kit.tag('t'))]
+            self.assertFalse(any('"source_ids"' in x or '"brand_policy"' in x for x in texts))
+            self.assertIn("日期：2026-11-13", z.read("xl/worksheets/sheet1.xml").decode())
+
+    def test_omitted_brand_cannot_reopen_known_exclusion(self):
+        initial = self.packet()
+        initial["leads"][0].update(brand_profile="brand_owner", status="excluded")
+        kit.commit(self.root, initial)
+        packet = self.packet("round-2", sid="SRC-002")
+        packet["leads"][0].pop("brand_profile")
+        packet["leads"][0]["status"] = "candidate"
+        before = (self.root / "execution/master.json").read_bytes()
+        with self.assertRaisesRegex(kit.LeadkitError, "Merged brand profile is excluded"):
+            kit.commit(self.root, packet)
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+        packet["leads"][0].update(brand_profile="mixed", status="main", reason="本轮原文纠正此前品牌方误判；独立混合经营且有白牌商品")
+        kit.commit(self.root, packet)
+        saved = kit.load_master(self.root)[0]["leads"]["TEST-001"]
+        self.assertEqual(saved["brand_profile"], "mixed")
+        self.assertEqual(saved["status"], "main")
+        self.assertEqual(saved["history"][-1]["brand_profile"], "brand_owner")
 
     def test_batch_id_traversal_rejected(self):
         with self.assertRaises(kit.LeadkitError):
