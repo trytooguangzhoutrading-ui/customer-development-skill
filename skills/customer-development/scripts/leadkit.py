@@ -15,12 +15,12 @@ import tempfile
 import unicodedata
 import zipfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PRODUCTS = ["智能眼镜", "智能手表", "智能手环", "智能戒指", "蓝牙耳机", "蓝牙音响"]
 LEVELS = {"current_original", "cached_original", "third_party_original", "search_snippet", "failed_read"}
 STRONG = {"current_original", "cached_original", "third_party_original"}
@@ -124,7 +124,7 @@ def init_workspace(root):
         require(not any(p.exists() or p.is_symlink() for p in reserved), "init refuses to overwrite an existing project; choose a new workspace")
         for name in ("execution", "research", "outputs"):
             (root / name).mkdir()
-        config = {"schema_version": 1, "products": PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "rules_version": VERSION}
+        config = {"schema_version": 1, "products": PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "supplier_constraints": {}, "activity_max_age_days": 180, "rules_version": VERSION}
         safe_write(root / "config.json", config)
         master = {"schema_version": 1, "created_at": now(), "updated_at": now(), "leads": {}, "sources": {}, "batches": {}}
         safe_write(root / "execution" / "master.json", master)
@@ -135,7 +135,7 @@ def valid_id(value, label, pattern=ID_RE):
     require(isinstance(value, str) and pattern.fullmatch(value), "Invalid %s: use a stable ASCII ID" % label)
 
 
-def snapshot(root, batch_id):
+def basic_snapshot(root, batch_id):
     valid_id(batch_id, "batch_id", BATCH_RE)
     with locked(root):
         master, sha = load_master(root)
@@ -145,9 +145,14 @@ def snapshot(root, batch_id):
         target.mkdir()
         baseline = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "created_at": now(), "lead_ids": sorted(master["leads"])}
         safe_write(target / "snapshot.json", baseline)
-        packet = {"schema_version": 2, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "limitations": []}
+        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
         safe_write(target / "batch.json", packet)
     return {"batch_id": batch_id, "base_sha256": sha, "batch_path": str(target / "batch.json"), "snapshot_path": str(target / "snapshot.json")}
+
+
+def snapshot(root, batch_id, overrides=None):
+    import leadkit_workflow
+    return leadkit_workflow.snapshot(root, batch_id, overrides)
 
 
 def nonempty(value, label):
@@ -225,19 +230,19 @@ def actionable_contact(contact, sources):
             and any(sources[x]["level"] in STRONG for x in contact.get("action_source_ids", [])))
 
 
-def derive_priority(lead, sources):
+def derive_priority(lead, sources, task=None):
     if lead["status"] != "main":
         return "", "未通过正式客户准入，不评级"
     capability = [x for x in lead.get("capability_evidence", []) if any(sources[s]["level"] in STRONG for s in x["source_ids"])]
     activity = lead.get("ongoing_activity", {})
-    if capability and any(sources[s]["level"] in CURRENT for s in activity.get("source_ids", [])):
+    if capability and recent_activity(activity, (task or {}).get("activity_max_age_days", 180)) and any(sources[s]["level"] in CURRENT for s in activity.get("source_ids", [])):
         ids = sorted({s for x in capability for s in x["source_ids"]} | set(activity["source_ids"]))
         return "A", "已通过准入；经营能力：%s；持续经营：%s [%s]" % ("；".join(x["detail"] for x in capability), activity["detail"], " ".join(ids))
     return "B", "已通过产品、白牌、主体、地域、客户类型和联系入口准入；经营能力或持续经营依据尚不齐全，不推定采购规模"
 
 
 def validate_packet(packet, master):
-    require(isinstance(packet, dict) and packet.get("schema_version") == 2, "New commits require batch schema_version 2; create a new snapshot and apply v1.1 rules")
+    require(isinstance(packet, dict) and packet.get("schema_version") == 3, "New commits require batch schema_version 3; create a new snapshot and apply v1.2 rules")
     valid_id(packet.get("batch_id"), "batch_id", BATCH_RE)
     require(isinstance(packet.get("base_sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", packet["base_sha256"]), "base_sha256 must come from snapshot")
     task = packet.get("task")
@@ -382,47 +387,320 @@ def validate_packet(packet, master):
             require(isinstance(lead["manual_notes"], str), "manual_notes must be text")
         if lead.get("sales_stage", "未联系") != "未联系":
             raise LeadkitError("Research cannot create sales events or change sales_stage")
+    validate_v3(packet, master, sources)
     return sources
+
+
+def recent_activity(activity, max_age):
+    """Reading a page today does not make an old business event recent."""
+    try:
+        observed = date.fromisoformat(activity.get("observed_on", ""))
+    except (ValueError, TypeError):
+        return False
+    age = (datetime.now(timezone.utc).date() - observed).days
+    return 0 <= age <= max_age
+
+
+def task_scopes(task):
+    scopes = task.get("geo_scope")
+    if scopes is None:
+        scopes = [dict({"country": c}, **{k: task[k] for k in ("city", "market", "address") if task.get(k)}) for c in task["countries"]]
+    require(isinstance(scopes, list) and bool(scopes), "geo_scope must be a nonempty array")
+    for scope in scopes:
+        require(isinstance(scope, dict) and set(scope) <= {"country", "city", "market", "address"}, "Invalid geo_scope fields")
+        nonempty(scope.get("country"), "geo_scope.country")
+        require("全球" in task["countries"] or scope["country"] in task["countries"], "geo_scope country outside task countries")
+        for key, value in scope.items():
+            nonempty(value, "geo_scope." + key)
+    return scopes
+
+
+def scope_key(task):
+    # Request wording, run dates and target counts must not create new eligibility scopes.
+    dimensions = {"geo_scope": sorted([{k: normalized(v) for k, v in s.items()} for s in task_scopes(task)], key=lambda x: json.dumps(x, sort_keys=True)), "products": sorted(task["products"]), "buyer_types": sorted(task["customer_profile"]["buyer_types"]), "requirements": sorted(task["requirements"]), "supplier_constraints": task["customer_profile"].get("supplier_constraints", {}), "brand_policy": "white_label_required"}
+    return "scope-" + digest_bytes(encoded(dimensions))[:24]
+
+
+def matched_products(lead, task, sources):
+    def available(group):
+        return {x["product"] for x in lead.get(group, []) if any(sources[s]["level"] in STRONG for s in x.get("source_ids", []))}
+    return sorted(set(task["products"]) & available("product_evidence") & available("white_label_evidence"))
+
+
+def validate_issues(items, sources, label):
+    require(isinstance(items, list), label + " must be an array")
+    seen = set()
+    for item in items:
+        require(isinstance(item, dict), label + " items must be objects")
+        valid_id(item.get("issue_id"), label + ".issue_id")
+        require(item["issue_id"] not in seen, "Duplicate issue_id")
+        seen.add(item["issue_id"])
+        for field in ("kind", "detail", "next_action", "next_trigger"):
+            nonempty(item.get(field), label + "." + field)
+        require(item.get("state") in {"open", "resolved", "blocked"}, "Invalid issue.state")
+        require(type(item.get("attempts")) is int and item["attempts"] >= 0, "issue.attempts must be nonnegative integer")
+        refs(item.get("source_ids", []), label + ".source_ids", sources, strong=item["state"] == "resolved", required=item["state"] == "resolved")
+        if item["state"] == "resolved":
+            iso_time(item.get("resolved_at"), label + ".resolved_at")
+
+
+def validate_checks(items, keys, key_field, sources, label, main, unknown_allowed=False):
+    require(isinstance(items, list), label + " must be array")
+    found = {}
+    for item in items:
+        require(isinstance(item, dict) and item.get(key_field) in keys, "Unknown " + label + " key")
+        key = item[key_field]
+        require(key not in found, "Duplicate " + label + " key")
+        found[key] = item
+        require(item.get("status") in {"matched", "unknown", "conflict"}, "Invalid " + label + " status")
+        nonempty(item.get("detail"), label + ".detail")
+        refs(item.get("source_ids", []), label + ".source_ids", sources, strong=item["status"] != "unknown", required=item["status"] != "unknown")
+    if main:
+        for key in keys:
+            require(key in found, "main needs explicit " + label + " for " + key)
+            require(found[key]["status"] in ({"matched", "unknown"} if unknown_allowed else {"matched"}), "main has unresolved or conflicting " + label)
+
+
+def validate_input_reference(value):
+    require(isinstance(value, dict), "input_reference must be an object")
+    nonempty(value.get("file"), "input_reference.file")
+    if "sheet" in value:
+        nonempty(value["sheet"], "input_reference.sheet")
+    if "row" in value:
+        require(type(value["row"]) is int and value["row"] > 0, "input_reference.row must be positive integer")
+    if "sha256" in value:
+        require(isinstance(value["sha256"], str) and bool(re.fullmatch(r"[a-f0-9]{64}", value["sha256"])), "Invalid input_reference.sha256")
+
+
+def validate_v3(packet, master, sources):
+    task = packet["task"]
+    scopes = task_scopes(task)
+    age = task.get("activity_max_age_days", 180)
+    require(type(age) is int and 1 <= age <= 730, "activity_max_age_days must be 1..730")
+    validate_issues(packet["queue"], sources, "queue")
+    prior_queue = {q["issue_id"]: q for q in master.get("queue", [])}
+    for q in packet["queue"]:
+        if q["issue_id"] in prior_queue:
+            require(q["attempts"] >= prior_queue[q["issue_id"]]["attempts"], "queue attempts cannot decrease")
+    ids = {x["lead_id"] for x in packet["leads"]}
+    for q in packet["queue"]:
+        if q.get("lead_id"):
+            require(q["lead_id"] in ids or q["lead_id"] in master["leads"], "queue lead_id is unknown")
+    coverage = packet.get("coverage")
+    require(isinstance(coverage, list), "coverage must be an array")
+    pairs = set()
+    discovered = {}
+    for cell in coverage:
+        require(isinstance(cell, dict) and cell.get("product") in task["products"], "coverage product outside task")
+        nonempty(cell.get("channel"), "coverage.channel")
+        pair = (cell["product"], cell["channel"])
+        require(pair not in pairs, "Duplicate coverage product/channel")
+        pairs.add(pair)
+        inputs = cell.get("input_references", [])
+        require(isinstance(inputs, list), "coverage.input_references must be array")
+        for reference in inputs:
+            validate_input_reference(reference)
+        status = cell.get("status")
+        require(status in {"unsearched", "blocked", "searched_zero", "searched"}, "Invalid coverage.status")
+        require(type(cell.get("attempts")) is int and cell["attempts"] >= 0, "coverage.attempts must be nonnegative integer")
+        require((status == "unsearched" and cell["attempts"] == 0) or (status != "unsearched" and cell["attempts"] > 0), "coverage attempts disagree with status")
+        if status in {"blocked", "unsearched"}:
+            string_list(cell.get("source_ids", []), "coverage.source_ids")
+            require(set(cell.get("source_ids", [])) <= set(sources), "coverage missing source")
+        else:
+            refs(cell.get("source_ids", []), "coverage.source_ids", sources, required=not inputs)
+        string_list(cell.get("limitations", []), "coverage.limitations")
+        if status in {"blocked", "unsearched"}:
+            require(bool(cell.get("limitations")), "blocked/unsearched coverage needs limitations")
+        found = cell.get("discovered_lead_ids", [])
+        string_list(found, "coverage.discovered_lead_ids")
+        require(set(found) <= ids, "coverage references lead outside current packet")
+        require(not found or status in {"searched", "searched_zero"}, "Unsearched/blocked coverage cannot contain discovered leads")
+        if status == "searched":
+            require(any(x["lead_id"] in found and x["status"] == "main" and cell["product"] in matched_products(x, task, sources) for x in packet["leads"]), "searched requires a qualified lead for this product")
+        if status == "searched_zero":
+            require(not any(x["lead_id"] in found and x["status"] == "main" and cell["product"] in matched_products(x, task, sources) for x in packet["leads"]), "searched_zero cannot contain qualified product leads")
+        for lid in found:
+            discovered.setdefault(lid, set()).add(cell["channel"])
+    require(set(task["products"]) <= {p for p, _ in pairs}, "coverage must expose every requested product, including unsearched ones")
+    for lead in packet["leads"]:
+        lid, main = lead["lead_id"], lead["status"] == "main"
+        for field in ("exclusion", "relationship_evidence", "location_match", "duplicate_review"):
+            if field in lead:
+                require(isinstance(lead[field], dict), field + " must be an object")
+                refs(lead[field].get("source_ids", []), field + ".source_ids", sources, required=False)
+        validate_issues(lead.get("issues", []), sources, "lead.issues")
+        old_issues = {x["issue_id"]: x for x in master["leads"].get(lid, {}).get("issues", [])}
+        for issue in lead.get("issues", []):
+            if issue["issue_id"] in old_issues:
+                require(issue["attempts"] >= old_issues[issue["issue_id"]]["attempts"], "issue.attempts cannot decrease")
+        origins = lead.get("discovered_by", [])
+        require(isinstance(origins, list) and bool(origins), "lead.discovered_by must record actual discovery channel")
+        for origin in origins:
+            require(isinstance(origin, dict), "discovered_by item must be object")
+            nonempty(origin.get("channel"), "discovered_by.channel")
+            if "input_reference" in origin:
+                validate_input_reference(origin["input_reference"])
+                require(any(origin["input_reference"] in cell.get("input_references", []) for cell in coverage if cell["channel"] == origin["channel"] and lid in cell.get("discovered_lead_ids", [])), "input_reference must be recorded in matching coverage")
+            refs(origin.get("source_ids", []), "discovered_by.source_ids", sources, required="input_reference" not in origin)
+        require(set(x["channel"] for x in origins) <= discovered.get(lid, set()), "discovered_by channel missing from coverage")
+        validate_checks(lead.get("requirement_checks", []), task["requirements"], "requirement", sources, "requirement_checks", main)
+        validate_checks(lead.get("supplier_fit", []), list(task["customer_profile"].get("supplier_constraints", {})), "constraint", sources, "supplier_fit", main, True)
+        if main:
+            location = lead.get("location_match", {})
+            aliases = location.get("aliases", {})
+            require(isinstance(aliases, dict) and set(aliases) <= {"city", "market", "address"}, "Invalid location_match.aliases")
+            matched = []
+            for index, scope in enumerate(scopes):
+                if scope["country"] not in {"全球", lead["country"]}:
+                    continue
+                if all(normalized(lead.get(k, "")) == normalized(v) or (location.get("scope_index") == index and normalized(aliases.get(k, "")) == normalized(v)) for k, v in scope.items() if k != "country"):
+                    matched.append(index)
+            require(bool(matched), "main lead location outside or unknown for task geo_scope")
+            def researched_scope(index):
+                scope = scopes[index]
+                for region in packet["region_research"]:
+                    if region["status"] == "blocked" or region["country"] != lead["country"]:
+                        continue
+                    city_ok = not scope.get("city") or normalized(region.get("city", "")) == normalized(scope["city"]) or normalized(scope["city"]) in normalized(region["area"])
+                    market_ok = not scope.get("market") or scope.get("city") or normalized(scope["market"]) in normalized(region["area"]) or any(normalized(x["name"]) == normalized(scope["market"]) for x in region["markets"])
+                    if city_ok and market_ok:
+                        return True
+                return False
+            require(any(researched_scope(index) for index in matched), "main needs region_research applicable to its city or market scope")
+            if aliases:
+                require(location.get("relation") == "within" and location.get("scope_index") in matched, "location_match must identify an in-scope position")
+                nonempty(location.get("detail"), "location_match.detail")
+                refs(location.get("source_ids", []), "location_match.source_ids", sources, strong=True)
+        exclusion = lead.get("exclusion")
+        if lead["status"] == "excluded":
+            require(isinstance(exclusion, dict), "excluded needs documented exclusion, not an unsupported guess")
+            require(exclusion.get("code") in {"brand_owner", "official_store", "brand_exclusive", "outside_scope", "product_mismatch", "buyer_mismatch", "closed", "user_excluded", "duplicate"}, "Invalid exclusion.code")
+            nonempty(exclusion.get("detail"), "exclusion.detail")
+            require(exclusion.get("origin") in {"evidence", "user"}, "Invalid exclusion.origin")
+            if exclusion["origin"] == "user":
+                require(exclusion["code"] == "user_excluded", "User exclusions must use user_excluded code")
+                nonempty(exclusion.get("user_instruction"), "exclusion.user_instruction")
+            else:
+                refs(exclusion.get("source_ids", []), "exclusion.source_ids", sources, strong=True)
+            if lead.get("brand_profile") in EXCLUDED_BRANDS:
+                require(exclusion["code"] == lead["brand_profile"] or exclusion["code"] == "user_excluded", "exclusion.code must match brand fact")
+        canonical = lead.get("canonical_id")
+        if canonical:
+            valid_id(canonical, "canonical_id")
+            require(canonical != lid and canonical in (ids | set(master["leads"])), "canonical_id must identify another existing entity")
+            relation = lead.get("relationship_evidence", {})
+            nonempty(relation.get("detail"), "relationship_evidence.detail")
+            refs(relation.get("source_ids", []), "relationship_evidence.source_ids", sources, strong=True)
+            require(lead["status"] == "excluded" and exclusion["code"] == "duplicate", "Merged alias must be excluded with duplicate reason")
+        if exclusion and exclusion.get("code") == "duplicate":
+            require(bool(canonical), "duplicate exclusion requires canonical_id")
+        for contact in lead.get("contacts", []):
+            kind, value = contact["kind"], contact["value"].strip()
+            if kind in {"phone", "whatsapp"}:
+                require(bool(re.fullmatch(r"[+\d ()\-.]+", value)) and 6 <= len(re.sub(r"\D", "", value)) <= 18, "Invalid business phone format")
+            if kind == "email":
+                require(bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value)), "Invalid business email format")
+            if kind == "website":
+                require(contact.get("identity_scope", "unknown") in {"unknown", "owned_domain", "platform_store"}, "Invalid website identity_scope")
+                if contact.get("identity_scope") == "owned_domain":
+                    refs(contact.get("ownership_source_ids", []), "ownership_source_ids", sources, strong=True)
+                if contact.get("identity_scope") == "platform_store":
+                    nonempty(contact.get("platform"), "contact.platform")
+                    require(bool(contact.get("seller_id") or urlsplit(value).path.strip("/")), "platform_store needs seller_id or store URL path")
+            refs(contact.get("ownership_source_ids", []), "contact.ownership_source_ids", sources, required=False)
+            if contact.get("contact_id"):
+                valid_id(contact["contact_id"], "contact_id")
+        entity = lead.get("entity_status", "unknown")
+        require(entity in {"active", "unknown", "closed", "merged"}, "Invalid entity_status")
+        if entity == "closed":
+            require(exclusion and exclusion.get("code") == "closed", "closed entity needs closure evidence")
+        if entity == "merged":
+            require(bool(canonical), "merged entity needs canonical_id")
+
+
+def merge_issues(old, incoming, unknowns=None):
+    combined = {x["issue_id"]: copy.deepcopy(x) for x in old}
+    for item in incoming:
+        combined[item["issue_id"]] = copy.deepcopy(item)
+    known_details = {x["detail"] for x in combined.values()}
+    for detail in unknowns or []:
+        if detail in known_details:
+            continue
+        known_details.add(detail)
+        key = "legacy-" + digest_bytes(detail.encode("utf-8"))[:20]
+        if key not in combined:
+            combined[key] = {"issue_id": key, "kind": "legacy_unknown", "detail": detail, "state": "open", "attempts": 0, "next_action": "核对历史待核问题", "next_trigger": "下次相关采集时", "source_ids": []}
+    return list(combined.values())
 
 
 def normalized(value):
     return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", value).casefold())
 
 
-def contact_key(contact):
+def canonical_url(value):
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    if not host:
+        return value.strip().rstrip("/")
+    return host + parsed.path.rstrip("/") + ("?" + parsed.query if parsed.query else "")
+
+
+def contact_key(contact, country=""):
     kind, value = contact["kind"], contact["value"].strip()
     if kind in {"phone", "whatsapp"}:
-        return "number:" + re.sub(r"\D", "", value)
+        digits = re.sub(r"\D", "", value)
+        # Never infer an international prefix for a local number.
+        return "number:" + ("+" if value.startswith("+") else normalized(country) + ":local:") + digits
     if kind == "email":
         return "email:" + value.casefold()
     if kind == "website":
-        host = (urlsplit(value).hostname or "").casefold().removeprefix("www.")
-        if host and not any(host == p or host.endswith("." + p) for p in PLATFORMS):
-            return "domain:" + host
+        scope = contact.get("identity_scope", "unknown")
+        if scope == "owned_domain":
+            host = (urlsplit(value).hostname or "").casefold().removeprefix("www.")
+            return "domain:" + host if host else None
+        # Generic hostnames are never merchant identities. Full store URLs can be.
+        if scope == "platform_store":
+            return "store:" + contact.get("platform", "").casefold() + ":" + ((urlsplit(value).hostname or "").casefold() + ":" + str(contact["seller_id"]) if contact.get("seller_id") else canonical_url(value))
         return None
-    return kind + ":" + value.casefold().rstrip("/")
+    return kind + ":" + canonical_url(value)
+
+
+def contact_identity(contact, country=""):
+    key = contact_key(contact, country) or (contact["kind"] + ":" + canonical_url(contact["value"]))
+    # Phone and WhatsApp may identify the same merchant, but remain separate entries.
+    return "contact-" + digest_bytes((contact["kind"] + "|" + key).encode("utf-8"))[:24]
+
+
+def canonical_entity(lid, leads):
+    seen = set()
+    while leads.get(lid, {}).get("canonical_id"):
+        require(lid not in seen, "canonical_id cycle")
+        seen.add(lid)
+        lid = leads[lid]["canonical_id"]
+        require(lid in leads, "canonical_id target missing")
+    return lid
 
 
 def duplicate_hints(leads, focus_ids=None):
     buckets = {}
     for lead in leads.values():
+        entity = canonical_entity(lead["lead_id"], leads)
         keys = {"name:" + normalized(lead["name"])}
         keys.update("name:" + normalized(a) for a in lead.get("aliases", []) if isinstance(a, str))
         for contact in lead.get("contacts", []):
-            key = contact_key(contact)
+            if contact.get("status", "active") != "active":
+                continue
+            key = contact_key(contact, lead.get("country", ""))
             if key and not key.endswith(":"):
                 keys.add(key)
         for key in keys:
-            buckets.setdefault(key, set()).add(lead["lead_id"])
-    output = []
-    for key, ids in sorted(buckets.items()):
-        if len(ids) > 1 and (focus_ids is None or ids & set(focus_ids)):
-            output.append({"matching_key": key, "lead_ids": sorted(ids), "action": "review_relationship_do_not_auto_merge"})
-    return output
+            buckets.setdefault(key, set()).add(entity)
+    focus = {canonical_entity(lid, leads) for lid in (focus_ids or leads)}
+    return [{"matching_key": key, "lead_ids": sorted(ids), "strength": "weak" if key.startswith("name:") else "strong", "action": "review_relationship_do_not_auto_merge"} for key, ids in sorted(buckets.items()) if len(ids) > 1 and ids & focus]
 
 
 def append_unique(old_items, new_items):
-    """Keep earlier evidence/contacts; an explicit correction lives in unknowns/history."""
     combined = copy.deepcopy(old_items)
     seen = {json.dumps(item, ensure_ascii=False, sort_keys=True) for item in combined}
     for item in new_items:
@@ -433,22 +711,130 @@ def append_unique(old_items, new_items):
     return combined
 
 
-def merge_contacts(old_items, new_items):
-    combined = copy.deepcopy(old_items)
-    lookup = {(c["kind"], c["value"]): i for i, c in enumerate(combined)}
+def merge_contacts(old_items, new_items, country="", sources=None, batch_id=None):
+    combined = []
+    for item in old_items:
+        contact = copy.deepcopy(item)
+        contact.setdefault("contact_id", contact_identity(contact, country))
+        combined.append(contact)
+    lookup = {contact_identity(c, country): i for i, c in enumerate(combined)}
     for incoming in new_items:
-        key = (incoming["kind"], incoming["value"])
+        key = contact_identity(incoming, country)
+        if incoming.get("contact_id"):
+            known = [x for x in combined if x["contact_id"] == incoming["contact_id"]]
+            require(not known or contact_identity(known[0], country) == key, "contact_id cannot change identity; create a new contact")
+            require(known or incoming["contact_id"] == key, "Unknown contact_id; omit to derive from canonical entry")
+        replacement = copy.deepcopy(incoming)
         if key in lookup:
             old = combined[lookup[key]]
-            replacement = dict(old, **copy.deepcopy(incoming))
-            replacement["source_ids"] = append_unique(old.get("source_ids", []), incoming.get("source_ids", []))
-            if old.get("whatsapp_source_ids") or incoming.get("whatsapp_source_ids"):
-                replacement["whatsapp_source_ids"] = append_unique(old.get("whatsapp_source_ids", []), incoming.get("whatsapp_source_ids", []))
+            replacement = dict(old, **replacement)
+            replacement["contact_id"] = old["contact_id"]
+            for field in ("source_ids", "whatsapp_source_ids", "action_source_ids", "ownership_source_ids"):
+                if field in old or field in incoming:
+                    replacement[field] = append_unique(old.get(field, []), incoming.get(field, []))
+            replacement["value_variants"] = append_unique(old.get("value_variants", [old["value"]]), [incoming["value"]])
+        else:
+            replacement["contact_id"] = key
+            replacement["value_variants"] = [incoming["value"]]
+        replacement["status"] = incoming.get("status", "active")
+        replacement["reachability"] = incoming.get("reachability", "untested")
+        if key in lookup and (combined[lookup[key]].get("status") == "invalid" or combined[lookup[key]].get("reachability") == "unavailable") and incoming.get("status", "active") == "active" and incoming.get("reachability", "untested") == "untested":
+            old_contact = combined[lookup[key]]
+            novel = set(incoming.get("source_ids", [])) - set(old_contact.get("source_ids", []))
+            cutoff = old_contact.get("invalidated_at", old_contact.get("last_verified_at", ""))
+            require(sources and any(s in sources and sources[s]["level"] in STRONG and (not cutoff or datetime.fromisoformat(sources[s]["read_at"].replace("Z", "+00:00")) >= datetime.fromisoformat(cutoff.replace("Z", "+00:00"))) for s in novel), "Reactivating invalid contact requires new verification evidence after invalidation")
+        if incoming.get("status") == "invalid":
+            replacement["invalidated_at"] = now()
+        if sources:
+            old_refs = set(combined[lookup[key]].get("source_ids", [])) if key in lookup else set()
+            times = [sources[s]["read_at"] for s in incoming.get("source_ids", []) if sources[s]["level"] in STRONG and s not in old_refs]
+            if times:
+                replacement["last_verified_at"] = max(times, key=lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")))
+                replacement["verified_batch_id"] = batch_id
+        if key in lookup:
             combined[lookup[key]] = replacement
         else:
             lookup[key] = len(combined)
-            combined.append(copy.deepcopy(incoming))
+            combined.append(replacement)
     return combined
+
+
+def merged_lead(old, incoming, packet, sources, stamp):
+    bid = packet["batch_id"]
+    lead = copy.deepcopy(old or {})
+    lead.update(copy.deepcopy(incoming))
+    if lead.get("brand_profile") in EXCLUDED_BRANDS:
+        require(incoming["status"] == "excluded", "Merged brand profile is excluded; explicitly correct brand_profile with evidence")
+    if old:
+        history = copy.deepcopy(old.get("history", []))
+        history.append({k: v for k, v in old.items() if k != "history"})
+        lead["history"] = history
+        for field in ("manual_notes", "manual_owner", "sales_stage"):
+            if field in old:
+                lead[field] = old[field]
+        for field in ("identity_source_ids", "location_source_ids", "product_evidence", "white_label_evidence", "aliases"):
+            lead[field] = append_unique(old.get(field, []), incoming.get(field, []))
+    else:
+        lead.update(created_at=stamp, manual_notes=incoming.get("manual_notes", ""), manual_owner="", sales_stage="未联系")
+    lead["contacts"] = merge_contacts((old or {}).get("contacts", []), incoming.get("contacts", []), incoming["country"], sources, bid)
+    if incoming["status"] == "main":
+        require(not lead.get("canonical_id"), "Canonical alias cannot qualify independently")
+        require(any(actionable_contact(c, sources) for c in lead["contacts"]), "Merged main needs actionable contact")
+        if (old or {}).get("entity_status") == "closed":
+            require(incoming.get("entity_status") == "active", "Closed entity needs explicit evidence-backed active correction")
+            require(bool(set(incoming.get("identity_source_ids", [])) - set(old.get("identity_source_ids", []))), "Reopening closed entity requires new identity evidence")
+    lead["issues"] = merge_issues((old or {}).get("issues", []), incoming.get("issues", []), append_unique((old or {}).get("unknowns", []) if not (old or {}).get("issues") else [], incoming.get("unknowns", [])))
+    lead["unknowns"] = [x["detail"] for x in lead["issues"] if x["state"] != "resolved"]
+    if incoming["status"] == "main":
+        require(not any(x["kind"] == "employee_correction" and x["state"] != "resolved" for x in lead["issues"]), "Resolve employee_correction evidence before requalifying main")
+    key = scope_key(packet["task"])
+    qualifications = copy.deepcopy((old or {}).get("qualifications", {}))
+    if old and not qualifications and old.get("status"):
+        qualifications["legacy-unreviewed"] = {"status": old["status"], "priority": "", "qualified_products": [], "requires_review": True, "reason": "旧版全局资格保留，未按1.2复核"}
+    priority, reason = derive_priority(incoming, sources, packet["task"])
+    qualifications[key] = {"status": incoming["status"], "priority": priority, "priority_reason": reason, "qualified_products": matched_products(incoming, packet["task"], sources) if incoming["status"] == "main" else [], "task": copy.deepcopy(packet["task"]), "batch_id": bid, "updated_at": stamp, "reason": incoming["reason"], "source_ids": sorted(lead_source_ids(incoming))}
+    lead["qualifications"] = qualifications
+    lead["last_task_status"] = incoming["status"]
+    lead["last_scope_id"] = key
+    lead["entity_status"] = "merged" if lead.get("canonical_id") else incoming.get("entity_status", (old or {}).get("entity_status", "unknown"))
+    global_exclusion = incoming.get("exclusion", {}).get("code") in EXCLUDED_BRANDS | {"closed"}
+    if global_exclusion:
+        lead["global_exclusion"] = copy.deepcopy(incoming["exclusion"])
+        # A confirmed closed or brand-only entity cannot retain actionable old qualification.
+        for qkey, qualification in qualifications.items():
+            if qkey != key and qualification["status"] == "main":
+                qualification.update(status="candidate", priority="", requires_review=True, reason="主体事实变化，历史资格待复核")
+    elif incoming["status"] == "main":
+        lead.pop("global_exclusion", None)
+    if not any(actionable_contact(c, sources) for c in lead["contacts"]):
+        for qualification in qualifications.values():
+            if qualification["status"] == "main":
+                qualification.update(status="candidate", priority="", requires_review=True, reason="现有联系入口失效，资格待补核")
+    # Compatibility field is aggregate, not the latest task decision.
+    states = [q["status"] for q in qualifications.values() if not q.get("requires_review")]
+    lead["status"] = "excluded" if lead.get("canonical_id") or lead.get("global_exclusion") else ("main" if "main" in states else "candidate" if "candidate" in states else incoming["status"])
+    lead["priority"], lead["priority_reason"] = priority, reason
+    lead["qualified_products"] = qualifications[key]["qualified_products"]
+    lead.update(rules_version=VERSION, updated_at=stamp, last_batch_id=bid)
+    return lead
+
+
+def prepare_validation(packet, master):
+    sources = validate_packet(packet, master)
+    proposed = copy.deepcopy(master["leads"])
+    for incoming in packet["leads"]:
+        proposed[incoming["lead_id"]] = merged_lead(proposed.get(incoming["lead_id"]), incoming, packet, sources, now())
+    hints = duplicate_hints(proposed, [x["lead_id"] for x in packet["leads"]])
+    for incoming in packet["leads"]:
+        relevant = [h for h in hints if incoming["lead_id"] in h["lead_ids"] and h["strength"] == "strong"]
+        if incoming["status"] == "main" and relevant:
+            review = incoming.get("duplicate_review", {})
+            require(review.get("decision") == "distinct_entities", "Potential duplicate main lead %s: reuse correct stable ID or document distinct_entities evidence" % incoming["lead_id"])
+            nonempty(review.get("reason"), "duplicate_review.reason")
+            refs(review.get("source_ids", []), "duplicate_review.source_ids", sources, strong=True)
+            others = {lid for hint in relevant for lid in hint["lead_ids"] if lid != incoming["lead_id"]}
+            require(others <= set(review.get("related_lead_ids", [])), "duplicate_review must cover every matched lead ID")
+    return {"sources": sources, "leads": proposed, "duplicate_hints": hints}
 
 
 def backup_master(root, expected_sha):
@@ -487,64 +873,51 @@ def commit(root, packet):
             saved = master["batches"][bid]
             require(saved["packet_sha256"] == fingerprint, "Batch ID already exists with different content")
             return {"batch_id": bid, "already_committed": True, "counts": saved["counts"]}
-        sources = validate_packet(packet, master)
+        prepared = prepare_validation(packet, master)
         require(packet["base_sha256"] == sha, "Master changed after snapshot; reread and reconcile before updating base_sha256")
-        baseline_path = root / "research" / bid / "snapshot.json"
-        baseline = read_json(baseline_path)
+        baseline = read_json(root / "research" / bid / "snapshot.json")
         require(baseline.get("base_sha256") == packet["base_sha256"], "Batch snapshot does not match. Create a new batch after reconciliation")
         require(baseline.get("batch_id") == bid, "Snapshot batch ID mismatch")
         stamp = now()
-        for incoming in packet["leads"]:
-            old = master["leads"].get(incoming["lead_id"])
-            lead = copy.deepcopy(old) if old else {}
-            lead.update(copy.deepcopy(incoming))
-            # Omitted fields inherit prior facts; that must not reopen a known excluded brand.
-            if lead.get("brand_profile") in EXCLUDED_BRANDS:
-                require(lead["status"] == "excluded", "Merged brand profile is excluded; keep excluded status or explicitly correct brand_profile with evidence")
-            if old:
-                history = copy.deepcopy(old.get("history", []))
-                previous = {k: v for k, v in old.items() if k != "history"}
-                history.append(previous)
-                lead["history"] = history
-                lead["created_at"] = old["created_at"]
-                for field in ("manual_notes", "manual_owner", "sales_stage"):
-                    if field in old:
-                        lead[field] = old[field]
-                for field in ("identity_source_ids", "location_source_ids", "product_evidence", "aliases", "unknowns"):
-                    lead[field] = append_unique(old.get(field, []), lead.get(field, []))
-                lead["contacts"] = merge_contacts(old.get("contacts", []), lead.get("contacts", []))
-            else:
-                lead["created_at"] = stamp
-                lead.setdefault("manual_notes", "")
-                lead.setdefault("manual_owner", "")
-                lead["sales_stage"] = "未联系"
-            # Eligibility and priority describe this batch, never silently inherit a prior A.
-            lead["priority"], lead["priority_reason"] = derive_priority(incoming, sources)
-            lead["rules_version"] = VERSION
-            lead["updated_at"] = stamp
-            lead["last_batch_id"] = bid
-            master["leads"][lead["lead_id"]] = lead
-        master["sources"] = sources
-        ids = [x["lead_id"] for x in packet["leads"]]
-        hints = duplicate_hints(master["leads"], ids)
-        for lead in packet["leads"]:
-            relevant = [hint for hint in hints if lead["lead_id"] in hint["lead_ids"]]
-            if lead["status"] == "main" and relevant:
-                review = lead.get("duplicate_review")
-                require(isinstance(review, dict) and review.get("decision") == "distinct_entities", "Potential duplicate main lead %s: reuse the correct stable ID, retain candidate status, or document distinct_entities evidence" % lead["lead_id"])
-                nonempty(review.get("reason"), "duplicate_review.reason")
-                refs(review.get("source_ids", []), "duplicate_review.source_ids", sources, strong=True)
-                others = {lid for hint in relevant for lid in hint["lead_ids"] if lid != lead["lead_id"]}
-                require(others <= set(review.get("related_lead_ids", [])), "duplicate_review must cover every matched lead ID")
         counts = {status: sum(x["status"] == status for x in packet["leads"]) for status in ("main", "candidate", "excluded")}
-        master["batches"][bid] = {"schema_version": 2, "rules_version": VERSION, "region_research": packet["region_research"], "packet_sha256": fingerprint, "committed_at": stamp, "task": packet["task"], "lead_ids": ids, "source_ids": [s["source_id"] for s in packet["sources"]], "lead_snapshots": [copy.deepcopy(master["leads"][lid]) for lid in ids], "queue": packet["queue"], "limitations": packet["limitations"], "counts": counts, "duplicate_hints": hints}
+        counts.update(new_entities=0, updated_entities=0, first_qualified=0, requalified=0, new_contacts=0, new_sources=len([s for s in packet["sources"] if s["source_id"] not in master["sources"]]))
+        key = scope_key(packet["task"])
+        snapshots = []
+        for incoming in packet["leads"]:
+            lid = incoming["lead_id"]
+            old = master["leads"].get(lid)
+            lead = prepared["leads"][lid]
+            if not old and not lead.get("canonical_id"):
+                counts["new_entities"] += 1
+            elif old and not lead.get("canonical_id"):
+                counts["updated_entities"] += 1
+            if incoming["status"] == "main" and key not in (old or {}).get("qualifications", {}):
+                counts["first_qualified"] += 1
+            if old:
+                before = old.get("qualifications", {}).get(key, {}).get("status")
+                if before in {"candidate", "excluded"} and incoming["status"] == "main":
+                    counts["requalified"] += 1
+            previous_contacts = {contact_identity(c, incoming["country"]) for c in (old or {}).get("contacts", [])}
+            counts["new_contacts"] += sum(contact_identity(c, incoming["country"]) not in previous_contacts for c in lead["contacts"])
+            # Freeze the current task result, never the aggregate entity compatibility status.
+            frozen = copy.deepcopy(lead)
+            frozen["status"] = incoming["status"]
+            frozen["product_evidence"] = copy.deepcopy(incoming.get("product_evidence", []))
+            frozen["white_label_evidence"] = copy.deepcopy(incoming.get("white_label_evidence", []))
+            frozen["ongoing_activity"] = copy.deepcopy(incoming.get("ongoing_activity", {}))
+            snapshots.append(frozen)
+        master["leads"] = prepared["leads"]
+        master["sources"] = prepared["sources"]
+        ids = [x["lead_id"] for x in packet["leads"]]
+        # Global follow-up issues are updated by stable identity; omission never closes one.
+        master["queue"] = merge_issues(master.get("queue", []), packet["queue"])
+        master["batches"][bid] = {"schema_version": 3, "rules_version": VERSION, "scope_id": key, "region_research": packet["region_research"], "packet_sha256": fingerprint, "committed_at": stamp, "task": packet["task"], "lead_ids": ids, "source_ids": [s["source_id"] for s in packet["sources"]], "lead_snapshots": snapshots, "queue": packet["queue"], "coverage": packet["coverage"], "limitations": packet["limitations"], "counts": counts, "duplicate_hints": prepared["duplicate_hints"]}
         master["updated_at"] = stamp
-        # One authoritative atomic write. No state is split across a ledger and receipt.
         backup_path = backup_master(root, sha)
         safe_write(root / "execution" / "master.json", master)
         saved, after_sha = load_master(root)
         require(saved["batches"][bid]["packet_sha256"] == fingerprint, "Saved batch read-back failed")
-    return {"batch_id": bid, "already_committed": False, "counts": counts, "master_sha256": after_sha, "backup_path": str(backup_path), "duplicate_hints": hints}
+    return {"batch_id": bid, "already_committed": False, "counts": counts, "master_sha256": after_sha, "backup_path": str(backup_path), "duplicate_hints": prepared["duplicate_hints"]}
 
 
 def column_name(index):
@@ -664,6 +1037,13 @@ def lead_source_ids(lead):
         result.update(contact["source_ids"])
         result.update(contact.get("whatsapp_source_ids", []))
         result.update(contact.get("action_source_ids", []))
+    for field in ("exclusion", "relationship_evidence", "location_match"):
+        result.update(lead.get(field, {}).get("source_ids", []))
+    for group in ("issues", "discovered_by", "requirement_checks", "supplier_fit"):
+        for item in lead.get(group, []):
+            result.update(item.get("source_ids", []))
+    for contact in lead.get("contacts", []):
+        result.update(contact.get("ownership_source_ids", []))
     return result
 
 
@@ -676,6 +1056,14 @@ def regional_source_ids(region):
     return result
 
 
+def contact_display(contact, batch_id):
+    state = contact.get("status", "active")
+    label = {"historical": "历史入口", "invalid": "无效入口"}.get(state)
+    if label is None:
+        label = "本轮已核" if contact.get("verified_batch_id") == batch_id else "历史沿用未复核"
+    return "%s：%s（%s；%s；%s；末次核验：%s；%s；编号：%s）[%s]" % (contact["kind"], contact["value"], contact["role"], contact["attribution"], label, contact.get("last_verified_at", "历史未记录"), "已知不可用" if contact.get("reachability") == "unavailable" else "可达未测试", contact.get("contact_id", "旧版未编号"), " ".join(contact["source_ids"]))
+
+
 def export_batch(root, batch_id, output):
     master, _ = load_master(root)
     require(batch_id in master["batches"], "Unknown committed batch")
@@ -685,28 +1073,30 @@ def export_batch(root, batch_id, output):
     if not legacy:
         leads = sorted(leads, key=lambda x: {"A": 0, "B": 1}.get(x.get("priority"), 2))
     header = ["客户编号", "商户名称", "国家", "城市", "地址／精度", "经营角色", "匹配产品及证据摘要", "公开业务入口", "适配理由", "待核问题", "来源编号", "人工备注"]
-    header += ["品牌经营类型", "白牌经营证据", "所在市场／位置精度", "近期经营依据", "开发优先级", "评级理由"]
-    widths = [18, 28, 16, 18, 34, 22, 52, 52, 42, 42, 28, 32, 22, 52, 34, 52, 18, 60]
+    header += ["品牌经营类型", "白牌经营证据", "所在市场／位置精度", "近期经营依据", "开发优先级", "评级理由", "本任务合格产品", "供货条件核对"]
+    widths = [18, 28, 16, 18, 34, 22, 52, 52, 42, 42, 28, 32, 22, 52, 34, 52, 18, 60, 30, 55]
     output_rows = {"main": [header], "candidate": [header]}
     for lead in leads:
         if lead["status"] not in output_rows:
             continue
         evidence = "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("product_evidence", []))
-        contacts = "\n".join("%s：%s（%s；%s；%s；%s）[%s]" % (x["kind"], x["value"], x["role"], x["attribution"], {"active": "当前采集", "historical": "历史入口", "invalid": "无效入口"}[x.get("status", "active")], "已知不可用" if x.get("reachability") == "unavailable" else "可达未测试", " ".join(x["source_ids"])) for x in lead.get("contacts", []))
-        output_rows[lead["status"]].append([lead["lead_id"], lead["name"], lead["country"], lead.get("city", ""), lead.get("address", "未知"), lead.get("buyer_type", "未知"), evidence or lead.get("channel_fit", "未知"), contacts, lead["reason"], "\n".join(lead.get("unknowns", [])), " ".join(sorted(lead_source_ids(lead))), lead.get("manual_notes", ""), BRAND_LABELS.get(lead.get("brand_profile"), "旧版未评估" if legacy else "品牌类型待核"), "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("white_label_evidence", [])), lead.get("market_location", "未明确"), (lead.get("ongoing_activity", {}).get("detail", "未明确") + "；日期：" + lead.get("ongoing_activity", {}).get("observed_on", "未公开") + " [" + " ".join(lead.get("ongoing_activity", {}).get("source_ids", [])) + "]"), "旧版未评级" if legacy else (lead.get("priority") or "未评级"), "历史批次，未按1.1规则重新资格核验" if legacy else lead.get("priority_reason", "未评级")])
+        contacts = "\n".join(contact_display(x, batch_id) for x in lead.get("contacts", []))
+        output_rows[lead["status"]].append([lead["lead_id"], lead["name"], lead["country"], lead.get("city", ""), lead.get("address", "未知"), lead.get("buyer_type", "未知"), evidence or lead.get("channel_fit", "未知"), contacts, lead["reason"], "\n".join(lead.get("unknowns", [])), " ".join(sorted(lead_source_ids(lead))), lead.get("manual_notes", ""), BRAND_LABELS.get(lead.get("brand_profile"), "旧版未评估" if legacy else "品牌类型待核"), "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("white_label_evidence", [])), lead.get("market_location", "未明确"), (lead.get("ongoing_activity", {}).get("detail", "未明确") + "；日期：" + lead.get("ongoing_activity", {}).get("observed_on", "未公开") + " [" + " ".join(lead.get("ongoing_activity", {}).get("source_ids", [])) + "]"), "旧版未评级" if legacy else (lead.get("priority") or "未评级"), "历史批次，未按1.1规则重新资格核验" if legacy else lead.get("priority_reason", "未评级"), "、".join(lead.get("qualified_products", [])) or "历史未单列", "\n".join("%s：%s；%s" % (x["constraint"], {"matched":"已匹配","unknown":"未知","conflict":"冲突"}[x["status"]], x["detail"]) for x in lead.get("supplier_fit", [])) or "未配置或历史未核对"])
     source_rows = [["来源编号", "关联客户", "来源标题", "来源网址", "读取时间", "读取层级", "支持内容", "限制／资料日期"]]
     wanted = set(batch["source_ids"])
     for lead in leads:
         wanted.update(lead_source_ids(lead))
     for region in batch.get("region_research", []):
         wanted.update(regional_source_ids(region))
+    for cell in batch.get("coverage", []):
+        wanted.update(cell.get("source_ids", []))
     for sid in sorted(wanted):
         source = master["sources"][sid]
         linked = " ".join(x["lead_id"] for x in leads if sid in lead_source_ids(x))
         regional_links = ["地区预研：" + r["area"] for r in batch.get("region_research", []) if sid in regional_source_ids(r)]
         linked = " / ".join([linked] + regional_links).strip(" / ")
-        source_rows.append([sid, linked, source["title"], source["url"], source["read_at"], source["level"], source["excerpt"], "\n".join(str(source.get(k, "")) for k in ("limitations", "content_date") if source.get(k))])
-    notes = [["项目", "内容"], ["批次编号", batch_id], ["原始需求", batch["task"]["request"]], ["目标国家", "、".join(batch["task"]["countries"])], ["目标产品", "、".join(batch["task"]["products"])], ["本轮结果", "可开发候选 %d；待核 %d；后台排除 %d" % (batch["counts"]["main"], batch["counts"]["candidate"], batch["counts"]["excluded"])], ["结果边界", "可开发客户为符合本次研究条件的候选，不代表采购意愿、采购权限或可达性已确认。本技能未外联。"], ["已知限制", "\n".join(batch["limitations"]) or "无额外记录"], ["接续事项", "\n".join(q["next_action"] for q in batch["queue"]) or "无记录"], ["查重提示", "\n".join("%s：%s，关系待复核，未自动合并" % (h["matching_key"], " / ".join(h["lead_ids"])) for h in batch["duplicate_hints"]) or "无匹配提示"], ["数据时间", batch["committed_at"]]]
+        source_rows.append([sid, linked, source["title"], source["url"], source["read_at"], source["level"], source["excerpt"], "\n".join("；".join(str(x) for x in source[k]) if isinstance(source[k], list) else str(source[k]) for k in ("limitations", "content_date") if source.get(k))])
+    notes = [["项目", "内容"], ["批次编号", batch_id], ["原始需求", batch["task"]["request"]], ["目标国家", "、".join(batch["task"]["countries"])], ["目标产品", "、".join(batch["task"]["products"])], ["本轮结果", "可开发候选 %d；待核 %d；后台排除 %d" % (batch["counts"]["main"], batch["counts"]["candidate"], batch["counts"]["excluded"])], ["结果边界", "可开发客户为符合本次研究条件的候选，不代表采购意愿、采购权限或可达性已确认。本技能未外联。"], ["已知限制", "\n".join(batch["limitations"]) or "无额外记录"], ["接续事项", "\n".join(q["next_action"] for q in batch["queue"] if q.get("state") != "resolved") or "无记录"], ["查重提示", "\n".join("%s：%s，关系待复核，未自动合并" % (h["matching_key"], " / ".join(h["lead_ids"])) for h in batch["duplicate_hints"]) or "无匹配提示"], ["数据时间", batch["committed_at"]]]
     profile = batch["task"].get("customer_profile", {})
     notes += [["资格规则版本", batch.get("rules_version", "1.0.0（历史批次未重新核验）")], ["目标客户类型", "、".join(profile.get("buyer_types", [])) or "历史批次未单列"], ["品牌准入", "目标产品白牌经营有据；混合经营须有白牌证据；品牌方／官方店／专卖店排除" if not legacy else "历史规则，未按新门槛复核"], ["优先级说明", "A/B仅为已通过准入候选的研究交接优先级，不是成交概率；无评级不等于低价值。旧批次保留历史资格，不自动晋级。"]]
     for name, value in profile.get("supplier_constraints", {}).items():
@@ -719,6 +1109,14 @@ def export_batch(root, batch_id, output):
                 if group == "markets":
                     detail += "；" + item["kind"] + "；规模：" + {"large": "大型", "medium": "中型", "small": "小型", "unknown": "待核"}[item["size"]]
                 notes.append([region["area"] + "／" + label, detail + " [" + " ".join(item["source_ids"] + item.get("size_source_ids", [])) + "]"])
+    if batch.get("schema_version", 1) >= 3:
+        counts = batch["counts"]
+        notes += [["增量统计", "新主体 %d；更新主体 %d；首次该范围合格 %d；同范围重新合格 %d；新增联系入口 %d；新增来源 %d" % tuple(counts.get(k, 0) for k in ("new_entities", "updated_entities", "first_qualified", "requalified", "new_contacts", "new_sources"))], ["资格范围", batch.get("scope_id", "")], ["活动新鲜度窗口", str(batch["task"].get("activity_max_age_days", 180)) + " 天；按实际活动日期核对，不按页面读取日"]]
+        for cell in batch.get("coverage", []):
+            notes.append(["渠道覆盖：" + cell["product"] + "／" + cell["channel"], "%s；尝试 %d 次；关联客户：%s；限制：%s" % ({"unsearched":"未搜索", "blocked":"受阻", "searched_zero":"已搜索无合格", "searched":"已发现合格"}[cell["status"]], cell["attempts"], "、".join(cell.get("discovered_lead_ids", [])) or "无", "；".join(cell.get("limitations", [])) or "无")])
+        for cell in batch.get("coverage", []):
+            for reference in cell.get("input_references", []):
+                notes.append(["员工提供线索：" + cell["channel"], "文件：%s；工作表：%s；行：%s；仅发现出处，不是主体真实性或经营事实证据" % (reference["file"], reference.get("sheet", "未记录"), reference.get("row", "未记录"))])
     write_xlsx(output, [("可开发客户", output_rows["main"], widths), ("待核线索", output_rows["candidate"], widths), ("来源证据", source_rows, [18, 24, 34, 62, 28, 24, 80, 50]), ("采集说明", notes, [24, 100])])
     return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": batch["counts"], "sheets": 4}
 
@@ -748,7 +1146,7 @@ def main():
         elif args.command == "validate":
             master, sha = load_master(root)
             packet = read_json(args.batch)
-            validate_packet(packet, master)
+            prepare_validation(packet, master)
             result = {"valid": True, "base_matches_current": packet["base_sha256"] == sha, "fact_truth_verified": False}
         elif args.command == "dedupe":
             master, _ = load_master(root)
@@ -763,4 +1161,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.modules["leadkit"] = sys.modules[__name__]
     sys.exit(main())

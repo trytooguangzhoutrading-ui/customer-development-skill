@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "batch_id": "example-only",
   "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "task": {
@@ -25,7 +25,14 @@
       ],
       "brand_policy": "white_label_required",
       "supplier_constraints": {}
-    }
+    },
+    "activity_max_age_days": 180,
+    "geo_scope": [
+      {
+        "country": "测试国",
+        "city": "测试城"
+      }
+    ]
   },
   "sources": [
     {
@@ -53,19 +60,54 @@
       "product_evidence": [],
       "contacts": [],
       "reason": "结构示例，不能计入实际采集成果",
-      "unknowns": [
-        "全部事实尚未核验"
-      ],
+      "unknowns": [],
       "manual_notes": "",
       "brand_profile": "unknown",
       "white_label_evidence": [],
       "buyer_type_source_ids": [],
-      "market_location": "未知"
+      "market_location": "未知",
+      "discovered_by": [
+        {
+          "channel": "synthetic_example",
+          "source_ids": [
+            "EXAMPLE-SRC-001"
+          ]
+        }
+      ],
+      "issues": [
+        {
+          "issue_id": "EXAMPLE-ISSUE-001",
+          "kind": "unverified",
+          "detail": "完全虚构格式示例，没有实地或在线核验",
+          "state": "open",
+          "next_action": "实际任务使用真实来源替换示例，禁止把本示例当客户",
+          "attempts": 0,
+          "next_trigger": "actual_task_started",
+          "source_ids": []
+        }
+      ],
+      "requirement_checks": [
+        {
+          "requirement": "只交付真实读取后可归属的业务入口",
+          "status": "unknown",
+          "detail": "虚构示例未核验",
+          "source_ids": []
+        }
+      ],
+      "supplier_fit": []
     }
   ],
   "queue": [
     {
-      "next_action": "实际任务使用真实来源替换示例，禁止把本示例当客户"
+      "issue_id": "EXAMPLE-ISSUE-001",
+      "kind": "unverified",
+      "detail": "完全虚构格式示例，没有实地或在线核验",
+      "state": "open",
+      "next_action": "实际任务使用真实来源替换示例，禁止把本示例当客户",
+      "attempts": 0,
+      "next_trigger": "actual_task_started",
+      "source_ids": [],
+      "lead_id": "EXAMPLE-001"
     }
   ],
   "limitations": [
@@ -84,6 +126,23 @@
       "source_ids": [],
       "limitations": [
         "完全虚构结构示例，没有实际预研；实际任务须填写真实读取结果。"
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "product": "智能眼镜",
+      "channel": "synthetic_example",
+      "status": "searched_zero",
+      "attempts": 1,
+      "source_ids": [
+        "EXAMPLE-SRC-001"
+      ],
+      "discovered_lead_ids": [
+        "EXAMPLE-001"
+      ],
+      "limitations": [
+        "仅展示虚构字段结构，尝试计数不是实际采集成果"
       ]
     }
   ]
