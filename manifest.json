@@ -3,7 +3,7 @@
   "name": "customer-development-kit",
   "version": "1.0.0",
   "files": {
-    ".github/workflows/validate.yml": "62728300bca5d1d4ebbd46b52a972b229ec34692fbd7ddbee2e2d4e3bcb8e944",
+    ".github/workflows/validate.yml": "ec7e1788cfa783ff66aff3285cff28e9ce01042adee73ef4ed827f1bc01148b5",
     ".gitignore": "5b78c4c65bfd461d55709939ebb73e638bbf5eab4f546288fec90fa39cdea59b",
     "INSTALL.md": "1d58edc86e7ef8abb3f94b5be93172d1d7851ff5f80b704fc77d384f3c9fe912",
     "LICENSE": "a240ce9287f42fa46075729c7d1a15e00ad37cd6f4e38239d70ac0ec114b676a",
