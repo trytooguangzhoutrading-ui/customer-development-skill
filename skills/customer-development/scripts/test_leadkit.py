@@ -24,7 +24,7 @@ class LeadkitTests(unittest.TestCase):
     def packet(self, bid="round-1", lid="TEST-001", sid="SRC-001"):
         result = kit.snapshot(self.root, bid)
         packet = kit.read_json(result["batch_path"])
-        packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"], collection_strategy="legacy", completion_policy="target_or_coverage", business_priorities=[], preferred_buyer_types=[])
+        packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"], collection_strategy="legacy", completion_policy="target_or_coverage", business_priorities=[], preferred_buyer_types=[], supplementary_products=[])
         packet["sources"] = [{"source_id": sid, "url": "https://example.invalid/merchant", "title": "虚构测试原文", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "仅测试。虚构商户经营智能眼镜，测试国公开业务电话 +00123456789。"}]
         packet["leads"] = [{"lead_id": lid, "name": "虚构测试商户", "country": "测试国", "city": "测试城", "address": "仅测试地址", "status": "main", "identity_source_ids": [sid], "location_source_ids": [sid], "product_evidence": [{"product": "智能眼镜", "detail": "虚构测试型号", "source_ids": [sid]}], "contacts": [{"kind": "phone", "value": "+00123456789", "role": "商户公开业务电话", "attribution": "虚构商户原文同页", "source_ids": [sid]}], "reason": "仅用于离线测试", "unknowns": ["采购权限未核"], "manual_notes": "人工初始记录"}]
         packet["sources"].append({"source_id": "REG-" + sid, "url": "https://example.invalid/region", "title": "虚构地区研究", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "虚构测试国使用测试语言，有商户目录；全部虚构。"})

@@ -20,8 +20,10 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
 
-VERSION = "1.3.0"
-PRODUCTS = ["智能眼镜", "智能手表", "智能手环", "智能戒指", "蓝牙耳机", "蓝牙音响"]
+VERSION = "1.3.1"
+PRIMARY_PRODUCTS = ["智能眼镜", "智能手表", "智能手表表带", "智能手环", "智能戒指"]
+SUPPLEMENTARY_PRODUCTS = ["蓝牙耳机", "蓝牙音响"]
+PRODUCTS = PRIMARY_PRODUCTS + SUPPLEMENTARY_PRODUCTS
 LEVELS = {"current_original", "cached_original", "third_party_original", "search_snippet", "failed_read"}
 STRONG = {"current_original", "cached_original", "third_party_original"}
 CONTACTS = {"phone", "whatsapp", "email", "website", "form", "facebook", "instagram", "telegram", "tiktok", "youtube", "linkedin", "zalo", "chat", "other"}
@@ -131,7 +133,7 @@ def init_workspace(root):
         require(not any(p.exists() or p.is_symlink() for p in reserved), "init refuses to overwrite an existing project; choose a new workspace")
         for name in ("execution", "research", "outputs"):
             (root / name).mkdir()
-        config = {"schema_version": 1, "products": PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "preferred_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户"], "business_priorities": ["buyer_type"], "brand_policy": "white_label_required", "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "supplier_constraints": {}, "activity_max_age_days": 180, "rules_version": VERSION}
+        config = {"schema_version": 1, "products": PRIMARY_PRODUCTS, "supplementary_products": SUPPLEMENTARY_PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "preferred_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户"], "business_priorities": ["buyer_type"], "brand_policy": "white_label_required", "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "supplier_constraints": {}, "activity_max_age_days": 180, "rules_version": VERSION}
         safe_write(root / "config.json", config)
         master = {"schema_version": 1, "created_at": now(), "updated_at": now(), "leads": {}, "sources": {}, "batches": {}}
         safe_write(root / "execution" / "master.json", master)
@@ -153,7 +155,7 @@ def basic_snapshot(root, batch_id):
         target.mkdir()
         baseline = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "created_at": now(), "lead_ids": sorted(master["leads"])}
         safe_write(target / "snapshot.json", baseline)
-        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
+        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRIMARY_PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
         safe_write(target / "batch.json", packet)
     return {"batch_id": batch_id, "base_sha256": sha, "batch_path": str(target / "batch.json"), "snapshot_path": str(target / "snapshot.json")}
 
@@ -169,6 +171,15 @@ def nonempty(value, label):
 
 def string_list(value, label):
     require(isinstance(value, list) and all(isinstance(x, str) for x in value), "%s must be a string array" % label)
+
+
+def validate_product_scope(task):
+    string_list(task.get("products"), "task.products")
+    require(bool(task["products"]) and set(task["products"]) <= set(PRODUCTS), "task.products must select supported product classes")
+    supplementary = task.get("supplementary_products", [])
+    string_list(supplementary, "task.supplementary_products")
+    require(set(supplementary) <= set(PRODUCTS), "Unknown supplementary product class")
+    require(not set(supplementary) & set(task["products"]), "Supplementary products must be outside this task's main product scope")
 
 
 def refs(value, label, sources, strong=False, required=True):
@@ -282,7 +293,7 @@ def validate_packet(packet, master):
     for field in ("countries", "products", "requirements"):
         string_list(task.get(field), "task." + field)
     require(bool(task["countries"]), "task.countries needs an explicit scope (use 全球 for global tasks)")
-    require(bool(task["products"]) and set(task["products"]) <= set(PRODUCTS), "task.products must select the configured six product classes")
+    validate_product_scope(task)
     require(isinstance(task.get("allow_channel_candidates", False), bool), "allow_channel_candidates must be boolean")
     profile = task.get("customer_profile")
     require(isinstance(profile, dict), "task.customer_profile is required")
@@ -1323,6 +1334,8 @@ def export_view(master, batch, batch_id, output):
         linked = " / ".join([linked] + regional_links).strip(" / ")
         source_rows.append([sid, linked, source["title"], source["url"], source["read_at"], source["level"], source["excerpt"], "\n".join("；".join(str(x) for x in source[k]) if isinstance(source[k], list) else str(source[k]) for k in ("limitations", "content_date") if source.get(k))])
     notes = [["项目", "内容"], ["批次编号", batch_id], ["原始需求", batch["task"]["request"]], ["目标国家", "、".join(batch["task"]["countries"])], ["目标产品", "、".join(batch["task"]["products"])], ["本轮结果", "可开发候选 %d；待核 %d；后台排除 %d" % (batch["counts"]["main"], batch["counts"]["candidate"], batch["counts"]["excluded"])], ["结果边界", "可开发客户为符合本次研究条件的候选，不代表采购意愿、采购权限或可达性已确认。本技能未外联。"], ["已知限制", "\n".join(batch["limitations"]) or "无额外记录"], ["接续事项", "\n".join(q["next_action"] for q in batch["queue"] if q.get("state") != "resolved") or "无记录"], ["查重提示", "\n".join("%s：%s，关系待复核，未自动合并" % (h["matching_key"], " / ".join(h["lead_ids"])) for h in batch["duplicate_hints"]) or "无匹配提示"], ["数据时间", batch["committed_at"]]]
+    if batch["task"].get("supplementary_products"):
+        notes.append(["附带拓展品类", "、".join(batch["task"]["supplementary_products"]) + "；同渠道顺带保留，本轮主线合格数不含仅匹配这些品类的商户"])
     profile = batch["task"].get("customer_profile", {})
     if batch.get("view") == "current":
         notes += [["导出视图", "当前有效资格；参考批次仅定位范围，不是当时冻结结果"], ["统计口径", "当前主库该范围全部资格的现状，新增数请查历史批次说明"]]

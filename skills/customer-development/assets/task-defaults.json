@@ -3,10 +3,9 @@
   "products": [
     "智能眼镜",
     "智能手表",
+    "智能手表表带",
     "智能手环",
-    "智能戒指",
-    "蓝牙耳机",
-    "蓝牙音响"
+    "智能戒指"
   ],
   "default_buyer_types": [
     "批发商",
@@ -20,7 +19,7 @@
   "employee_output": "xlsx",
   "outreach_enabled": false,
   "allow_channel_candidates": false,
-  "rules_version": "1.3.0",
+  "rules_version": "1.3.1",
   "brand_policy": "white_label_required",
   "activity_max_age_days": 180,
   "supplier_constraints": {},
@@ -41,5 +40,9 @@
     "当地市场商户"
   ],
   "collection_strategy": "region_size_ladder",
-  "completion_policy": "coverage"
+  "completion_policy": "coverage",
+  "supplementary_products": [
+    "蓝牙耳机",
+    "蓝牙音响"
+  ]
 }

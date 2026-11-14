@@ -18,7 +18,7 @@ python3 <SKILL_DIR>/scripts/leadkit_project.py inspect --project <当前项目�
 python3 <SKILL_DIR>/scripts/leadkit_project.py bind --project <项目根> --master <主库相对路径> --kind xlsx --config <公司配置相对路径.json> --rules <有效规则相对路径.md> --rules-version <规则版本> --additional-sources <补充来源清单.json>
 ```
 
-JSON主库使用kind=json且路径为某工作区的execution/master.json。公司配置是JSON对象；字段参照assets/task-defaults.json，不用覆盖真实公司设定。所有路径相对项目根；只读补充源可使用../其他项目/…，主库及有效规则必须在本项目中。补充JSON可为普通历史对象、批次或记录数组，不要求主库结构；只登记为阅读/查重来源，不自动导入。无补充源时省略--additional-sources。清单例：
+JSON主库使用kind=json且路径为某工作区的execution/master.json。公司配置是JSON对象；字段参照assets/task-defaults.json，不用覆盖真实公司设定。安装器不会替换已有配置；主管明确变更产品重点后，由Codex保留其他设置，只更新products与supplementary_products等已授权字段，新任务记录新配置hash，旧批次保持冻结。所有路径相对项目根；只读补充源可使用../其他项目/…，主库及有效规则必须在本项目中。补充JSON可为普通历史对象、批次或记录数组，不要求主库结构；只登记为阅读/查重来源，不自动导入。无补充源时省略--additional-sources。清单例：
 
 ```json
 [{"kind":"xlsx","path":"history/其他已采客户.xlsx","label":"历史补充查重"}]

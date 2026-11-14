@@ -134,13 +134,13 @@ def snapshot(root, batch_id, overrides=None):
     core.require(isinstance(overrides, dict), "Task overrides must be an object")
     defaults = config.get("task_defaults", {})
     core.require(isinstance(defaults, dict), "config.task_defaults must be an object")
-    products = config.get("products", core.PRODUCTS)
+    products = config.get("products", core.PRIMARY_PRODUCTS)
     buyers = config.get("default_buyer_types", core.DEFAULT_BUYER_TYPES)
     core.require(isinstance(products, list) and products and set(products) <= set(core.PRODUCTS), "Invalid company products")
     core.require(isinstance(buyers, list) and buyers and all(isinstance(x, str) and x.strip() for x in buyers), "Invalid company buyer types")
     supply = config.get("supplier_profile", config.get("supplier_constraints", {}))
     core.require(isinstance(supply, dict), "config.supplier_profile must be an object")
-    task = {"products": products, "customer_profile": {"buyer_types": buyers, "brand_policy": "white_label_required", "supplier_constraints": supply}, "activity_max_age_days": config.get("activity_max_age_days", 180)}
+    task = {"products": products, "supplementary_products": copy.deepcopy(config.get("supplementary_products", [])), "customer_profile": {"buyer_types": buyers, "brand_policy": "white_label_required", "supplier_constraints": supply}, "activity_max_age_days": config.get("activity_max_age_days", 180)}
     for key, default in {"mode": "new", "target_count": 20, "work_budget": {"max_attempts": 80, "max_minutes": 45}, "business_priorities": [], "preferred_buyer_types": [], "collection_strategy": "region_size_ladder", "completion_policy": "coverage"}.items():
         task[key] = copy.deepcopy(config.get(key, default))
     if "target_metric" in config:
@@ -160,6 +160,16 @@ def snapshot(root, batch_id, overrides=None):
         core.require(region is None, "default_region must be a country string, object, list or null")
     task = _geo_merge({}, task)
     task = _geo_merge(_geo_merge(task, defaults), overrides)
+    # An explicit product assignment is a scoped task, not an instruction to
+    # carry the company's incidental categories into every specialist run.
+    if "products" in overrides and "supplementary_products" not in overrides:
+        task["supplementary_products"] = []
+    elif "products" in defaults and "supplementary_products" not in defaults and "supplementary_products" not in overrides:
+        task["supplementary_products"] = []
+    if "supplementary_products" not in overrides and "supplementary_products" not in defaults:
+        core.string_list(task.get("supplementary_products", []), "Company supplementary_products")
+        task["supplementary_products"] = [p for p in task.get("supplementary_products", []) if p not in task["products"]]
+    core.validate_product_scope(task)
     if "preferred_buyer_types" not in overrides and "preferred_buyer_types" not in defaults:
         allowed = task.get("customer_profile", {}).get("buyer_types", [])
         task["preferred_buyer_types"] = [buyer for buyer in task.get("preferred_buyer_types", []) if buyer in allowed]

@@ -29,14 +29,15 @@ batch_id为1–80位ASCII字母/数字/下划线/短横线，以字母或数字�
 | --- | --- |
 | request | 原始需求，非空字符串 |
 | countries | 非空字符串数组，全球用`["全球"]`；与客户国家统一写法 |
-| products | 六类固定产品中的非空子集；音箱先规范为蓝牙音响 |
+| products | 七类支持产品中的非空子集；新项目默认智能眼镜、智能手表、智能手表表带、智能手环、智能戒指；音箱先规范为蓝牙音响 |
+| supplementary_products | 主线外同渠道附带产品数组，默认蓝牙耳机、蓝牙音响；不与products重叠，不参与本轮main准入或合格目标。显式覆盖products时默认清空，除非同时明确提供附带范围；该字段不扩展任务资格范围、entry.products或必需coverage |
 | requirements | 必须满足的条件字符串数组；不把优先偏好混入 |
 | customer_profile | `{buyer_types:[...],brand_policy:"white_label_required",supplier_constraints:{...}}`；未知供货条件不填为事实 |
 | geo_scope | 范围对象数组，每项`country`及可选`city`、`market`、`address`；省略时从countries与旧city/market/address规范化 |
 | activity_max_age_days | 活动证据评估窗口，默认180，允许1–730；只影响A评级，不直接淘汰B |
 | allow_channel_candidates | 布尔值，默认false；允许相邻渠道候选，不豁免main门槛 |
 
-mode为new/continue/enrich；target_count为正整数，默认20；target_metric为new_qualified/qualified/updated，新采及继续默认new_qualified，补证默认updated。work_budget:{max_attempts:80,max_minutes:45}是每轮上限，次数正整数，分钟大于0且不超过1440，员工明确要求覆盖默认。运行账本与结束顺序见[research-progress.md](research-progress.md)。数量是目标而非最低交付承诺。供货条件包括已确认的产品、价格带、MOQ和供货方式，未确认不猜。任务资格按规范化范围存储，与原始需求措辞、数量目标分开；实体在另一产品或地域任务不匹配不抹掉已有资格。
+mode为new/continue/enrich；target_count为正整数，默认20；target_metric为new_qualified/qualified/updated，新采及继续默认new_qualified，补证默认updated。work_budget:{max_attempts:80,max_minutes:45}是每轮上限，次数正整数，分钟大于0且不超过1440，员工明确要求覆盖默认。运行账本与结束顺序见[research-progress.md](research-progress.md)。数量是目标而非最低交付承诺；默认合格统计只按五类主营products，附带音频线索不充数。供货条件包括已确认的产品、价格带、MOQ和供货方式，未确认不猜。任务资格按规范化范围存储，与原始需求措辞、数量目标分开；实体在另一产品或地域任务不匹配不抹掉已有资格。
 
 business_priorities为按先后排列的可选枚举：supplier_fit、product_coverage、buyer_type、procurement_access；preferred_buyer_types保存本轮偏好的画像类型。偏好不改变准入，也不混入requirements。新项目默认business_priorities=[buyer_type]，优先批发商、进口商、分销商、当地市场商户，并限制在本轮允许画像内；有显式偏好时按其可证指标排序，再按A/B，并列稳定。显式清空偏好后按A/B优先，旧配置不强制改写。
 
@@ -125,7 +126,7 @@ queue同样采用稳定issue字段，可附lead_id。attempts为非负整数；n
 
 ## 覆盖与计数
 
-coverage在**批次顶层**保存，每项`{product,channel,status,attempts,source_ids,limitations,discovered_lead_ids}`。每个任务产品至少一格，按实际计划渠道展开；状态为unsearched、blocked、searched_zero、searched。searched_zero指已研究但无合格结果，与未搜/受阻不同。attempts为实际尝试，limitations为字符串数组。不能为了填格捏造查询或强制六类均分客户数。
+coverage在**批次顶层**保存，每项`{product,channel,status,attempts,source_ids,limitations,discovered_lead_ids}`。每个任务产品至少一格，按实际计划渠道展开；状态为unsearched、blocked、searched_zero、searched。searched_zero指已研究但无合格结果，与未搜/受阻不同。attempts为实际尝试，limitations为字符串数组。不能为了填格捏造查询或强制各产品均分客户数。附带产品不代替主线coverage；同渠道顺带发现须保留真实发现归因及附带说明。
 
 lead.discovered_by为`[{channel,source_ids}]`，记录实际发现路径；多渠道同一主体只算一个新增。覆盖中的客户ID须能追溯到本批记录，准备阶段隔离坏行仍保留拒绝明细与修复事项，不假称覆盖已完成。
 
