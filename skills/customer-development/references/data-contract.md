@@ -1,4 +1,4 @@
-# 本地运行与数据契约 · 1.2
+# 本地运行与数据契约 · 1.3
 
 脚本只校验和保存已研究的记录，不联网、不证明来源真实。Codex须实际阅读证据并判断归属。Python 3.9+标准库即可。优先用snapshot生成结构，参照[虚构示例](../assets/batch-example.json)，不要猜字段。全部JSON用UTF-8；员工不负责填写JSON。
 
@@ -36,7 +36,11 @@ batch_id为1–80位ASCII字母/数字/下划线/短横线，以字母或数字�
 | activity_max_age_days | 活动证据评估窗口，默认180，允许1–730；只影响A评级，不直接淘汰B |
 | allow_channel_candidates | 布尔值，默认false；允许相邻渠道候选，不豁免main门槛 |
 
-可附mode、target_count、priorities；数量是目标而非最低交付承诺。供货条件包括已确认的产品、价格带、MOQ和供货方式，未确认不猜。任务资格按规范化范围存储，与原始需求措辞、数量目标分开；实体在另一产品或地域任务不匹配不抹掉已有资格。
+mode为new/continue/enrich；target_count为正整数，默认20；target_metric为new_qualified/qualified/updated，新采及继续默认new_qualified，补证默认updated。work_budget:{max_attempts:80,max_minutes:45}是每轮上限，次数正整数，分钟大于0且不超过1440，员工明确要求覆盖默认。运行账本与结束顺序见[research-progress.md](research-progress.md)。数量是目标而非最低交付承诺。供货条件包括已确认的产品、价格带、MOQ和供货方式，未确认不猜。任务资格按规范化范围存储，与原始需求措辞、数量目标分开；实体在另一产品或地域任务不匹配不抹掉已有资格。
+
+business_priorities为按先后排列的可选枚举：supplier_fit、product_coverage、buyer_type、procurement_access；preferred_buyer_types保存本轮偏好的画像类型。偏好不改变准入，也不混入requirements。新项目默认business_priorities=[buyer_type]，优先批发商、进口商、分销商、当地市场商户，并限制在本轮允许画像内；有显式偏好时按其可证指标排序，再按A/B，并列稳定。显式清空偏好后按A/B优先，旧配置不强制改写。
+
+task.collection_strategy为region_size_ladder（新发现默认）、provided_leads（指定名单补证）或legacy（旧任务兼容）。task.completion_policy为coverage或target_or_coverage，未指定数量的新发现默认coverage，20只作阶段观察目标；显式数量可采用target_or_coverage。新系统采集必须保存渠道地图、实际联系生态和执行账本，不能删策略字段模拟旧任务绕过。字段与命令见[research-progress.md](research-progress.md)。
 
 ## 地区预研与来源
 
@@ -85,13 +89,15 @@ brand_profile可为white_label、mixed、brand_owner、official_store、brand_ex
 
 excluded需`exclusion:{code,origin,detail,source_ids}`。code为brand_owner/official_store/brand_exclusive/outside_scope/product_mismatch/buyer_mismatch/closed/user_excluded/duplicate；origin为evidence或user。事实排除要可读证据，用户明确排除需user_instruction保留指令，不能把模型判断伪装成用户决定。证据不足使用candidate。
 
+非excluded记录不得携带旧exclusion对象。重新纳入被全局排除的主体时，须提供exclusion_resolution:{detail,source_ids}，引用新读取且能解释旧决定为何不再适用的可读证据；成功后旧决定进history，不保留相反的有效状态。仅增加联系方式不能解除品牌排除。
+
 ## 联系方式与去重
 
 contact必填`kind,value,role,attribution,source_ids`，value始终文本。kind支持phone、email、website、form、chat、whatsapp、zalo、facebook、instagram、telegram、tiktok、youtube、linkedin、other。
 
 - phone/email须有真实可归属入口与可读证据；格式正常不表示已验证可达。电话不推WhatsApp/Zalo。
 - form需`action:"form",action_evidence,action_source_ids`；社交/chat等需`action:"message"`及同样动作证据。展示主页不足。
-- WhatsApp另需whatsapp_source_ids和whatsapp_evidence。website永不单独支撑main。
+- WhatsApp另需whatsapp_source_ids和whatsapp_evidence。value可为完整号码、https://wa.me/<数字>、https://wa.me/message/<商家短码>或https://api.whatsapp.com/send?phone=<数字>。链接必须实际观察且归属商户，不从号码拼造；普通WhatsApp首页不接受。website永不单独支撑main。
 - status为active/historical/invalid；reachability仅untested/unavailable。本技能不拨打、不试发消息。无效、历史、已知不可用入口不支撑main。
 - 规范化用于同实体同入口匹配：保留原始写法和value_variants，不猜国家码、缺失号码或邮箱。contact_id、last_verified_at、verified_batch_id由运行层维护；更新失效须指向同一稳定入口。历史沿用未重读明确标识。失效入口重新激活须有失效之后的新核验来源，不能重复引用旧证据。
 
@@ -109,7 +115,11 @@ main只有同时具备经营能力、可读当前活动来源、实际日期且�
 
 主库分别保存entity_status（active/closed/merged/unknown）和qualifications（任务范围键→本次资格及qualified_products等）。一家公司可在眼镜任务合格、耳机任务不符。批次冻结当时结论；后续纠错不改写历史批次。当前资格须结合尚未关闭的问题及联系状态使用。
 
+procurement_access可附{detail,source_ids}，只记录可归属的采购/供应商接洽入口依据，不将销售客服升级为采购权限。business_priority由脚本推导，包含criteria、signals、reason；只表示已证事实与本轮偏好，不是金额、意愿或概率预测。
+
 issues为数组，每项`{issue_id,kind,detail,state,next_action,attempts,next_trigger,source_ids}`，state为open/resolved/blocked。resolved另需resolved_at及解决依据；无需再次执行已解决事项。旧unknowns可迁为未结问题，不因新批传空数组就自动消失。当前表显示未结事项，history保留解决轨迹。
+
+关键问题kind为identity_conflict、location_conflict、white_label_conflict、product_conflict、buyer_conflict、contact_conflict、employee_correction时，open或blocked都会阻止相关正式资格。其他问题可显式blocks_qualification:true；未知采购量等普通未知项不自动阻断。affected_scope_ids/affected_products可界定地域、产品类问题的范围；不填作用所有范围，身份/联系归属冲突始终作用主体。已存关键问题不能通过传空数组、改kind或改为非阻断来绕开，解决须保留新证据。
 
 queue同样采用稳定issue字段，可附lead_id。attempts为非负整数；next_trigger说明新证据/权限/时间等再次执行条件。不得把队列存在说成后台服务已安排，也不在条件未变化时无限重试。
 
@@ -119,12 +129,12 @@ coverage在**批次顶层**保存，每项`{product,channel,status,attempts,sour
 
 lead.discovered_by为`[{channel,source_ids}]`，记录实际发现路径；多渠道同一主体只算一个新增。覆盖中的客户ID须能追溯到本批记录，准备阶段隔离坏行仍保留拒绝明细与修复事项，不假称覆盖已完成。
 
-批次counts保存本轮main/candidate/excluded数量，并分别记录new_entities、updated_entities、requalified（同范围重新合格）、first_qualified（主体首次在该范围合格，包含新主体）、new_contacts、new_sources。新增来源、补一个电话或已有候选晋级不等于新增主体。这些指标有交叉，不相加成客户总数；不要用main总数冒充新增客户。
+批次counts保存本轮main/candidate/excluded数量，并分别记录new_entities、new_qualified_entities（本轮前未在主库出现且本轮合格的规范主体）、updated_entities、requalified（同范围重新合格）、first_qualified（主体首次在该范围合格，包含新主体）、new_contacts、new_sources。新增来源、补一个电话或已有候选晋级不等于新增主体。这些指标有交叉，不相加成客户总数；不要用main总数冒充新增客户。
 
 ## 保存与交付
 
 同一主库一个写入者。commit持锁核snapshot/hash，备份原始主库后原子替换并读回；冲突时重读、合并、另建基线，不强改旧hash。相同payload重试幂等。详细目录、断点及纠错在[persistence.md](persistence.md)。
 
-导出按本批冻结版本生成可开发客户、待核线索、来源证据、采集说明；A在B前。联系显示核验时效，未结问题与资格原因可读，覆盖和增量计数不藏在原始JSON里。排除明细留主库，计数留说明。零结果也据实导出。
+export导出本批冻结版本；export-current --batch-id <ID>或--scope-id <SCOPE>导出该范围当前有效客户。当前表从对应资格的证据快照取产品/地区事实，合并最新联系、人工备注、未结问题与主体状态，按当前日期重算评级，不借另一任务最新事实，不修改主库或历史表。旧批缺少可重建的范围证据时如实待核，不能猜。均生成可开发客户、待核线索、来源证据、采集说明；先按本轮有效业务偏好（新项目默认买家类型）排序，再按A/B；无额外偏好时A在B前。联系显示核验时效，未结问题与资格原因可读，覆盖和增量计数不藏在原始JSON里。排除明细留主库，计数留说明。零结果也据实导出。
 
 所有单元格按文本保存，编号/电话前缀不丢，文本不执行公式。交付前独立回读工作表、计数、来源、联系方式；有渲染工具则检查显示。脚本不能保证事实真伪或每国一定有足量客户。

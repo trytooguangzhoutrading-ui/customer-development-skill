@@ -3,7 +3,7 @@
   "batch_id": "example-only",
   "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "task": {
-    "request": "这是虚构结构示例，不是真实客户。实际任务从 snapshot 生成的 batch.json 填写。",
+    "request": "这是虚构的已提供线索补证结构示例，不是真实客户。全新地区发现必须从snapshot生成默认region_size_ladder任务并建立真实研究账本，不能复制本例绕过渠道预研。",
     "countries": [
       "测试国"
     ],
@@ -32,7 +32,18 @@
         "country": "测试国",
         "city": "测试城"
       }
-    ]
+    ],
+    "mode": "enrich",
+    "target_count": 20,
+    "target_metric": "updated",
+    "work_budget": {
+      "max_attempts": 80,
+      "max_minutes": 45
+    },
+    "business_priorities": [],
+    "preferred_buyer_types": [],
+    "collection_strategy": "provided_leads",
+    "completion_policy": "target_or_coverage"
   },
   "sources": [
     {

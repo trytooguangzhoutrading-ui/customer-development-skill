@@ -1,8 +1,8 @@
-# 保存、断点与纠错 · 1.2
+# 保存、断点与纠错 · 1.3
 
 ## 唯一主库
 
-新工作区使用本地JSON主库，Excel是交付视图。已有Excel主表继续作为权威入口，不为迁就脚本初始化第二个主库。安装器只更新技能，不迁移真实客户。研究可并行，一个主库只允许一个写入者。
+先按[project-context.md](project-context.md)定位项目绑定及有效规则。新工作区使用本地JSON主库，Excel是交付视图。已有Excel主表继续作为权威入口，不为迁就脚本初始化第二个主库。安装器只更新技能，不迁移真实客户。研究可并行，一个主库只允许一个写入者。
 
 新工作区目录：
 
@@ -11,25 +11,33 @@
 - execution/backups/：写入前以内容hash保存的准确主库备份。
 - research/<ID>/snapshot.json：研究开始前保存的主库基线。
 - research/<ID>/batch.json及断点：当前研究，不等于已正式入库。
+- execution/task-index.json：活动任务、交付索引；execution/channel-registry.json：实际工具及渠道可用性观察。
+- research/<ID>/research-log.json：本轮计划入口、尝试、分页/游标、固定起始时间、停止原因及接续历史；不是后台调度。
 - outputs/：交付Excel及可选纠错模板；不作为第二套JSON主库。
 
 init仅用于全新目录，拒绝覆盖。换电脑需另行传递已授权工作区，安装Skill不会共享客户或账号。
 
 ## 新任务与恢复
 
-先snapshot再联网。workflow snapshot自动继承config；`--overrides <TASK.json>`提供本轮任务明确变化，不能把上轮地区静默当所有新任务的地区。“继续原任务”使用resume指定原batch-id，不能只凭最新文件名混入另一地区。
+以下任务CLI用于JSON主库；已有Excel走下文及project-context.md中的Excel分支。先snapshot再联网。workflow snapshot自动继承config；`--overrides <TASK.json>`提供本轮任务明确变化，不能把上轮地区静默当所有新任务的地区。“继续”先status/continue读取持久活动任务；resume仍可用于明确批次草稿恢复。不能只凭最新文件名混入另一地区。城市、市场或地址的显式改变会同步规范geo_scope，禁止显示新地址却按旧范围准入。
 
 ```text
 python3 <SKILL_DIR>/scripts/leadkit_workflow.py snapshot --workspace <PROJECT> --batch-id <ID> --overrides <TASK.json>
 python3 <SKILL_DIR>/scripts/leadkit_workflow.py checkpoint --workspace <PROJECT> --batch <BATCH.json>
 python3 <SKILL_DIR>/scripts/leadkit_workflow.py resume --workspace <PROJECT> --batch-id <ID>
+python3 <SKILL_DIR>/scripts/leadkit_workflow.py status --workspace <PROJECT>
+python3 <SKILL_DIR>/scripts/leadkit_workflow.py continue --workspace <PROJECT>
 ```
 
 checkpoint允许任务尚未完成，保存实际候选、来源、预研、队列和覆盖；不谎称已通过commit。阶段有成果就保存，不等整批结束。恢复检查断点完整性、基线和当前主库；有冲突则在最新主库重做合并，另建批次，不能只改旧hash。未变化的失败路径不无限重试。
 
+未提交任务的continue恢复同一草稿及固定预算；已提交的任务建立新接续批，沿用任务范围、未读/受阻入口、已读历史与未结问题。数量目标未满时继续剩余目标；已达标后员工再说继续，按原目标启动下一轮。coverage模式中的数量仅是阶段观察值，继续未完路线，不能以达到该值关闭城市任务。换地区或产品是新任务，并仍对历史查重。多任务且没有明确活动指针时返回候选任务，不能猜。导出后用workflow record-delivery登记实际交付文件。
+
+专用客户工作区可运行`leadkit_workflow.py setup-project --workspace <PROJECT> --dedicated-workspace`。仅增量写入该目录AGENTS.md中的受管客户采集规则；先备份原文，保留其他规则，重复执行幂等。不修改全局配置，不在不明用途项目擅自加规则。员工安装后的项目设置需求即可授权此可逆设置。
+
 ## 逐条预检与原子提交
 
-先用prepare校验共享任务、来源和预研，再分离可提交客户与有错误的记录。错误原件、原因与修复事项保留；输出结果明确接受/拒绝数量及文件路径。重复关系与合并风险也应在提交前处理。共享头部无效时整批阻断，不把零客户包冒充成功。
+先用prepare校验共享任务、来源和预研，再分离可提交客户与有错误的记录。错误原件、原因与修复事项保留；输出结果明确接受/拒绝数量及文件路径。重复关系与合并风险也应在提交前处理。共享头部无效时整批阻断，不把零客户包冒充成功。prepare按相关记录组合处理，不由行顺序决定合并成败；指向既有主库客户的合法queue关闭/更新，即使本批无该客户行也须保留。
 
 ```text
 python3 <SKILL_DIR>/scripts/leadkit_workflow.py prepare --workspace <PROJECT> --batch <BATCH.json> --output-dir <PREPARED_DIR>
@@ -38,7 +46,7 @@ python3 <SKILL_DIR>/scripts/leadkit.py commit --workspace <PROJECT> --batch <pre
 
 使用prepare返回的真实路径。单条错误隔离不等于被排除客户已核实；留修复队列，最终说明尚未纳入的数量。修复后新建批次复用客户ID，不能重复增加主体。
 
-commit仍是完整事务：持锁→核基线→校验引用、资格和合并→保存精确备份→原子替换→回读。相同批次同payload重试返回原结果，相同ID不同内容拒绝。导出失败仅重试导出，不重新研究/提交。导出使用新文件名，不覆盖已交付版本。
+有执行账本时先prepare，再对有效子集research finish，最后commit；结束依据及修订见[research-progress.md](research-progress.md)。commit仍是完整事务：持锁→核基线→校验引用、资格和合并→保存精确备份→原子替换→回读。相同批次同payload重试返回原结果，相同ID不同内容拒绝。导出失败仅重试导出，不重新研究/提交。导出使用新文件名，不覆盖已交付版本。
 
 ## Excel纠错回流
 
@@ -60,7 +68,11 @@ python3 <SKILL_DIR>/scripts/leadkit_workflow.py corrections-apply --workspace <P
 
 该功能只用于采集纠错。负责人、报价、订单、销售阶段等不自动修改。
 
+纠错后应交付当前范围表。可在corrections-apply附`--output <CURRENT.xlsx> --batch-id <范围对应批次>`，或另行执行`leadkit.py export-current --workspace <PROJECT> --batch-id <ID> --output <CURRENT.xlsx>`；也可使用明确scope-id。旧批次export仍是原交付快照，不能把它当作纠错后的最新表。
+
 ## 已有Excel主库
+
+此分支由Codex使用表格工具和独立Excel任务索引执行；JSON的snapshot/status/continue/commit不会直接接收Excel。按[项目入口](project-context.md)登记活动任务和日志，多任务无指针不能按最近文件猜。
 
 先读真实表头、稳定ID、来源和人工字段，建立映射与只读查重索引。历史JSON、摘要和旧报告不替代当前原件。
 

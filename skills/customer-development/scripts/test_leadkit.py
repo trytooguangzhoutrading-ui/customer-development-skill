@@ -24,7 +24,7 @@ class LeadkitTests(unittest.TestCase):
     def packet(self, bid="round-1", lid="TEST-001", sid="SRC-001"):
         result = kit.snapshot(self.root, bid)
         packet = kit.read_json(result["batch_path"])
-        packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"])
+        packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"], collection_strategy="legacy", completion_policy="target_or_coverage", business_priorities=[], preferred_buyer_types=[])
         packet["sources"] = [{"source_id": sid, "url": "https://example.invalid/merchant", "title": "虚构测试原文", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "仅测试。虚构商户经营智能眼镜，测试国公开业务电话 +00123456789。"}]
         packet["leads"] = [{"lead_id": lid, "name": "虚构测试商户", "country": "测试国", "city": "测试城", "address": "仅测试地址", "status": "main", "identity_source_ids": [sid], "location_source_ids": [sid], "product_evidence": [{"product": "智能眼镜", "detail": "虚构测试型号", "source_ids": [sid]}], "contacts": [{"kind": "phone", "value": "+00123456789", "role": "商户公开业务电话", "attribution": "虚构商户原文同页", "source_ids": [sid]}], "reason": "仅用于离线测试", "unknowns": ["采购权限未核"], "manual_notes": "人工初始记录"}]
         packet["sources"].append({"source_id": "REG-" + sid, "url": "https://example.invalid/region", "title": "虚构地区研究", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "虚构测试国使用测试语言，有商户目录；全部虚构。"})
@@ -429,6 +429,9 @@ class LeadkitTests(unittest.TestCase):
             self.commit(packet)
         self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
         packet["leads"][0].update(brand_profile="mixed", status="main", reason="本轮原文纠正此前品牌方误判；独立混合经营且有白牌商品")
+        with self.assertRaisesRegex(kit.LeadkitError, "exclusion_resolution"):
+            self.commit(packet)
+        packet["leads"][0]["exclusion_resolution"] = {"detail":"新原文明确独立混合经营，纠正此前排除", "source_ids":["SRC-002"]}
         self.commit(packet)
         saved = kit.load_master(self.root)[0]["leads"]["TEST-001"]
         self.assertEqual(saved["brand_profile"], "mixed")
@@ -663,7 +666,7 @@ class LeadkitTests(unittest.TestCase):
             self.assertIsNone(archive.testzip())
 
     def test_employee_input_without_url_can_be_pending_not_main(self):
-        result = kit.snapshot(self.root, "offline-import")
+        result = kit.snapshot(self.root, "offline-import", overrides={"mode": "enrich"})
         packet = kit.read_json(result["batch_path"])
         packet["task"].update(request="补核员工提供的店名", countries=["测试国"], products=["智能眼镜"])
         reference = {"file":"employee-list.xlsx", "sheet":"线索", "row":2}
@@ -699,6 +702,225 @@ class LeadkitTests(unittest.TestCase):
     def test_batch_id_traversal_rejected(self):
         with self.assertRaises(kit.LeadkitError):
             kit.snapshot(self.root, "../escape")
+
+    def issue(self, kind="identity_conflict", **extra):
+        return dict({"issue_id":"CRITICAL-1", "kind":kind, "detail":"合成冲突待核", "state":"open", "attempts":0, "next_action":"读取原文解决冲突", "next_trigger":"next_collection", "source_ids":[]}, **extra)
+
+    def test_critical_conflicts_block_main_but_purchase_unknown_does_not(self):
+        packet = self.packet()
+        for kind in sorted(kit.BLOCKING_ISSUES):
+            with self.subTest(kind=kind):
+                packet["leads"][0]["issues"] = [self.issue(kind)]
+                with self.assertRaisesRegex(kit.LeadkitError, "qualification-blocking"):
+                    self.commit(packet)
+        packet["leads"][0]["issues"] = [self.issue("procurement_unknown")]
+        self.assertEqual(self.commit(packet)["counts"]["main"], 1)
+
+    def test_blocking_issue_cannot_be_disabled_or_relabelled(self):
+        first = self.packet()
+        first["leads"][0]["issues"] = [self.issue(blocks_qualification=False)]
+        with self.assertRaisesRegex(kit.LeadkitError, "cannot disable"):
+            self.commit(first)
+        first["leads"][0].update(status="candidate", issues=[self.issue()])
+        self.commit(first)
+        second = self.packet("round-2", sid="SRC-002")
+        with self.assertRaisesRegex(kit.LeadkitError, "qualification-blocking"):
+            self.commit(second)
+        second["leads"][0]["issues"] = [self.issue("unimportant")]
+        with self.assertRaisesRegex(kit.LeadkitError, "changing its kind"):
+            self.commit(second)
+        second["leads"][0]["issues"] = [self.issue(state="resolved", source_ids=["SRC-002"], resolved_at=kit.now(), attempts=1)]
+        self.assertEqual(self.commit(second)["counts"]["main"], 1)
+
+    def test_entity_conflict_cannot_hide_in_unrelated_product_or_scope(self):
+        packet = self.packet()
+        packet["leads"][0]["issues"] = [self.issue(affected_products=["智能手表"], affected_scope_ids=["scope-other"])]
+        with self.assertRaisesRegex(kit.LeadkitError, "qualification-blocking"):
+            self.commit(packet)
+        packet["leads"][0]["issues"] = [self.issue("product_conflict", affected_products=["智能手表"])]
+        self.assertEqual(self.commit(packet)["counts"]["main"], 1)
+
+    def test_new_critical_issue_revokes_existing_scope_qualification(self):
+        first = self.packet()
+        self.commit(first)
+        second = self.packet("round-2", sid="SRC-002")
+        second["task"]["products"] = ["智能手表"]
+        second["leads"][0].update(status="candidate", issues=[self.issue()])
+        self.commit(second)
+        saved = kit.load_master(self.root)[0]["leads"]["TEST-001"]
+        self.assertEqual(saved["status"], "candidate")
+        old_scope = saved["qualifications"][kit.scope_key(first["task"])]
+        self.assertEqual(old_scope["status"], "candidate")
+        self.assertTrue(old_scope["requires_review"])
+
+    def test_critical_queue_issue_blocks_related_entity(self):
+        packet = self.packet()
+        packet["queue"] = [self.issue(lead_id="TEST-001")]
+        with self.assertRaisesRegex(kit.LeadkitError, "queue issues"):
+            self.commit(packet)
+
+    def test_queue_only_conflict_revokes_old_main_without_researching_entity(self):
+        first = self.packet()
+        self.commit(first)
+        second = self.packet("round-2", sid="SRC-002")
+        second["leads"] = []
+        second["queue"] = [self.issue(lead_id="TEST-001")]
+        self.commit(second)
+        master, _ = kit.load_master(self.root)
+        lead = master["leads"]["TEST-001"]
+        self.assertEqual(lead["status"], "candidate")
+        self.assertEqual(lead["qualifications"][kit.scope_key(first["task"])]["status"], "candidate")
+        self.assertEqual(master["batches"]["round-1"]["lead_snapshots"][0]["status"], "main")
+
+    def test_nonexcluded_cannot_carry_exclusion(self):
+        packet = self.packet()
+        packet["leads"][0]["exclusion"] = {"code":"official_store", "origin":"evidence", "detail":"旧决定", "source_ids":["SRC-001"]}
+        for status in ("main", "candidate"):
+            packet["leads"][0]["status"] = status
+            with self.assertRaisesRegex(kit.LeadkitError, "Non-excluded lead"):
+                self.commit(packet)
+
+    def test_exclusion_resolution_needs_novel_evidence_and_keeps_history(self):
+        first = self.packet()
+        first["leads"][0].update(status="excluded", brand_profile="official_store", exclusion={"code":"official_store", "origin":"evidence", "detail":"旧排除", "source_ids":["SRC-001"]})
+        self.commit(first)
+        second = self.packet("round-2", sid="SRC-002")
+        second["leads"][0]["exclusion_resolution"] = {"detail":"新原文显示独立白牌经营", "source_ids":["SRC-001"]}
+        with self.assertRaisesRegex(kit.LeadkitError, "new strong evidence"):
+            self.commit(second)
+        second["leads"][0]["exclusion_resolution"]["source_ids"] = ["SRC-002"]
+        self.commit(second)
+        master, _ = kit.load_master(self.root)
+        lead = master["leads"]["TEST-001"]
+        self.assertEqual(lead["status"], "main")
+        self.assertNotIn("exclusion", lead)
+        self.assertNotIn("global_exclusion", lead)
+        self.assertEqual(lead["history"][-1]["exclusion"]["code"], "official_store")
+        self.assertEqual(master["batches"]["round-1"]["lead_snapshots"][0]["status"], "excluded")
+        self.assertEqual(kit.current_scope_view(master, kit.scope_key(second["task"]))[0]["status"], "main")
+
+    def test_whatsapp_official_urls_preserved_and_normalized_without_guessing(self):
+        urls = ["https://wa.me/00123456789", "https://wa.me/message/ABCcode123", "https://api.whatsapp.com/send?phone=00123456789&text=hello"]
+        for index, url in enumerate(urls):
+            sid = "WA-%d" % index
+            packet = self.packet("wa-%d" % index, sid=sid)
+            packet["leads"][0]["contacts"][0].update(kind="whatsapp", value=url, action="message", action_evidence="原文商户联系按钮", action_source_ids=[sid], whatsapp_evidence="原文明示WhatsApp", whatsapp_source_ids=[sid])
+            self.commit(packet)
+            saved = kit.load_master(self.root)[0]["leads"]["TEST-001"]["contacts"]
+            self.assertIn(url, [x["value"] for x in saved])
+        self.assertEqual(kit.contact_key({"kind":"whatsapp", "value":urls[0]}), kit.contact_key({"kind":"phone", "value":"+00123456789"}))
+        self.assertEqual(kit.contact_key({"kind":"whatsapp", "value":urls[1]}), "whatsapp:wa.me/message/ABCcode123")
+        self.assertNotEqual(kit.contact_key({"kind":"whatsapp", "value":urls[0]}, "测试国"), kit.contact_key({"kind":"phone", "value":"00123456789"}, "测试国"))
+        for value in ("https://wa.me.evil.invalid/00123456789", "http://wa.me/00123456789", "https://wa.me/merchant", "https://api.whatsapp.com/send?phone=abc"):
+            self.assertFalse(kit.valid_whatsapp(value))
+
+    def test_whatsapp_url_still_requires_contact_action_evidence(self):
+        packet = self.packet()
+        packet["leads"][0]["contacts"][0].update(kind="whatsapp", value="https://wa.me/message/ABC123", whatsapp_evidence="原文WA", whatsapp_source_ids=["SRC-001"])
+        with self.assertRaises(kit.LeadkitError):
+            self.commit(packet)
+
+    def test_current_export_uses_current_contacts_notes_without_mutating_history(self):
+        first = self.packet()
+        self.commit(first)
+        oldfile = self.root / "outputs/history.xlsx"
+        kit.export_batch(self.root, "round-1", oldfile)
+        historical = oldfile.read_bytes()
+        master, _ = kit.load_master(self.root)
+        lead = master["leads"]["TEST-001"]
+        lead["manual_notes"] = "员工最新备注"
+        lead["contacts"][0].update(status="invalid", reachability="unavailable")
+        kit.safe_write(self.root / "execution/master.json", master)
+        before = (self.root / "execution/master.json").read_bytes()
+        output = self.root / "outputs/current.xlsx"
+        result = kit.export_current(self.root, output, batch_id="round-1")
+        self.assertEqual(result["counts"], {"main":0,"candidate":1,"excluded":0})
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+        self.assertEqual(historical, oldfile.read_bytes())
+        with zipfile.ZipFile(output) as archive:
+            pending = archive.read("xl/worksheets/sheet2.xml").decode()
+            self.assertIn("员工最新备注", pending)
+            self.assertIn("无效入口", pending)
+            self.assertNotIn("TEST-001", archive.read("xl/worksheets/sheet1.xml").decode())
+
+    def test_current_scope_facts_do_not_leak_from_later_task_and_support_v12(self):
+        first = self.packet()
+        first["leads"][0]["reason"] = "眼镜任务独立理由"
+        self.commit(first)
+        second = self.packet("round-2", sid="SRC-002")
+        second["task"]["products"] = ["智能手表"]
+        second["leads"][0].update(reason="手表任务另一个理由", brand_profile="mixed")
+        for field in ("product_evidence", "white_label_evidence"):
+            second["leads"][0][field][0].update(product="智能手表", detail="手表独立证据")
+        self.commit(second)
+        master, _ = kit.load_master(self.root)
+        scope = kit.scope_key(first["task"])
+        for use_legacy in (False, True):
+            if use_legacy:
+                master["leads"]["TEST-001"]["qualifications"][scope].pop("evidence_snapshot")
+            row = kit.current_scope_view(master, scope)[0]
+            self.assertEqual(row["reason"], "眼镜任务独立理由")
+            self.assertEqual(row["brand_profile"], "white_label")
+            self.assertEqual(row["qualified_products"], ["智能眼镜"])
+            self.assertEqual([x["product"] for x in row["product_evidence"]], ["智能眼镜"])
+        del master["batches"]["round-1"]
+        row = kit.current_scope_view(master, scope)[0]
+        self.assertEqual(row["status"], "candidate")
+        self.assertEqual(row["qualified_products"], [])
+        self.assertNotIn("product_evidence", row)
+
+    def test_current_view_rechecks_freshness_and_unapplied_entity_conflicts(self):
+        first = self.packet()
+        first["leads"][0].update(capability_evidence=[{"kind":"wholesale", "detail":"批发证据", "source_ids":["SRC-001"]}], ongoing_activity={"detail":"活动", "source_ids":["SRC-001"], "observed_on":datetime.now(timezone.utc).date().isoformat()})
+        self.commit(first)
+        master, _ = kit.load_master(self.root)
+        scope = kit.scope_key(first["task"])
+        lead = master["leads"]["TEST-001"]
+        self.assertEqual(kit.current_scope_view(master, scope)[0]["priority"], "A")
+        lead["qualifications"][scope]["evidence_snapshot"]["ongoing_activity"]["observed_on"] = "2019-01-01"
+        self.assertEqual(kit.current_scope_view(master, scope)[0]["priority"], "B")
+        lead["issues"] = [self.issue()]
+        self.assertEqual(kit.current_scope_view(master, scope)[0]["status"], "candidate")
+        lead["issues"] = []
+        for state in ("closed", "merged"):
+            lead["entity_status"] = state
+            self.assertEqual(kit.current_scope_view(master, scope)[0]["status"], "excluded")
+        lead["entity_status"] = "active"
+        lead["global_exclusion"] = {"code":"official_store"}
+        self.assertEqual(kit.current_scope_view(master, scope)[0]["status"], "excluded")
+
+    def test_business_sort_preserves_default_ab_and_uses_only_explicit_preferences(self):
+        packet = self.packet()
+        a = packet["leads"][0]
+        a.update(capability_evidence=[{"kind":"wholesale", "detail":"批发依据", "source_ids":["SRC-001"]}], ongoing_activity={"detail":"近期经营", "source_ids":["SRC-001"], "observed_on":datetime.now(timezone.utc).date().isoformat()})
+        b = copy.deepcopy(a)
+        b.update(lead_id="TEST-002", name="另一虚构零售商", buyer_type="相关零售商", capability_evidence=[])
+        b["contacts"][0]["value"] = "+00999999999"
+        packet["leads"].append(b)
+        packet["task"]["preferred_buyer_types"] = ["相关零售商"]
+        self.commit(packet)
+        saved = kit.load_master(self.root)[0]["batches"]["round-1"]["lead_snapshots"]
+        self.assertEqual(sorted(saved, key=lambda x: kit.business_sort_key(x, packet["task"]))[0]["lead_id"], "TEST-001")
+        packet["task"]["business_priorities"] = ["buyer_type"]
+        self.assertEqual(sorted(saved, key=lambda x: kit.business_sort_key(x, packet["task"]))[0]["lead_id"], "TEST-002")
+        self.assertEqual(saved[1]["status"], "main")
+        self.assertIn("未知不等于不合格", saved[1]["business_priority"]["reason"])
+
+    def test_procurement_access_requires_original_source(self):
+        packet = self.packet()
+        packet["leads"][0]["procurement_access"] = {"detail":"采购通道", "source_ids":[]}
+        with self.assertRaisesRegex(kit.LeadkitError, "procurement_access.source_ids"):
+            self.commit(packet)
+
+    def test_new_qualified_count_excludes_candidate_and_existing_requalification(self):
+        first = self.packet()
+        first["leads"][0]["status"] = "candidate"
+        self.assertEqual(self.commit(first)["counts"]["new_qualified_entities"], 0)
+        second = self.packet("round-2", sid="SRC-002")
+        self.assertEqual(self.commit(second)["counts"]["new_qualified_entities"], 0)
+        third = self.packet("round-3", lid="TEST-003", sid="SRC-003")
+        third["leads"][0]["contacts"][0]["value"] = "+00888888888"
+        self.assertEqual(self.commit(third)["counts"]["new_qualified_entities"], 1)
 
 
 if __name__ == "__main__":
