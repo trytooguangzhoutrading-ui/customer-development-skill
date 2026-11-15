@@ -140,8 +140,9 @@ def snapshot(root, batch_id, overrides=None):
     core.require(isinstance(buyers, list) and buyers and all(isinstance(x, str) and x.strip() for x in buyers), "Invalid company buyer types")
     supply = config.get("supplier_profile", config.get("supplier_constraints", {}))
     core.require(isinstance(supply, dict), "config.supplier_profile must be an object")
-    task = {"products": products, "supplementary_products": copy.deepcopy(config.get("supplementary_products", [])), "customer_profile": {"buyer_types": buyers, "brand_policy": "white_label_required", "supplier_constraints": supply}, "activity_max_age_days": config.get("activity_max_age_days", 180)}
-    for key, default in {"mode": "new", "target_count": 20, "work_budget": {"max_attempts": 80, "max_minutes": 45}, "business_priorities": [], "preferred_buyer_types": [], "collection_strategy": "region_size_ladder", "completion_policy": "coverage"}.items():
+    brand_policy = config.get("brand_policy", "independent_product")
+    task = {"products": products, "supplementary_products": copy.deepcopy(config.get("supplementary_products", [])), "customer_profile": {"buyer_types": buyers, "brand_policy": brand_policy, "collect_brand_stores": config.get("collect_brand_stores", brand_policy == "independent_product"), "supplier_constraints": supply}, "activity_max_age_days": config.get("activity_max_age_days", 180)}
+    for key, default in {"mode": "new", "target_count": 20, "work_budget": {"max_attempts": 80, "max_minutes": 45}, "business_priorities": [], "preferred_buyer_types": [], "collection_strategy": "market_sequence", "completion_policy": "coverage"}.items():
         task[key] = copy.deepcopy(config.get(key, default))
     if "target_metric" in config:
         task["target_metric"] = config["target_metric"]
@@ -255,6 +256,71 @@ def resume(root, batch_id):
         return {"batch_id": batch_id, "committed": False, "base_matches_current": sha == baseline["base_sha256"], "requires_reconciliation": sha != baseline["base_sha256"], "packet": packet, "working_path": str(path / "batch.json")}
 
 
+def _configuration_review(root, task):
+    """Compare real defaults with a saved task without migrating either one.
+
+    A specialist request can intentionally differ from company defaults. A file
+    hash or version mismatch is reported separately, never as a scope change.
+    """
+    import leadkit_project as project
+    found = project.guard_json_workspace(root)
+    bound_root, binding = found if found else (root, {})
+    config_path = project._path(bound_root, binding.get("config_path", "config.json"), "config_path")
+    task_context = task.get("project_context", {})
+    versions = {"runtime": core.VERSION, "binding": binding.get("rules_version"),
+                "task_binding": task_context.get("rules_version"),
+                "task_runtime": task_context.get("runtime_rules_version")}
+    result = {"available": config_path.is_file(), "config_path": str(config_path),
+              "task_scope": {key: copy.deepcopy(task.get(key, [])) for key in ("products", "supplementary_products")},
+              "rules_versions": versions, "scope_changed_automatically": False}
+    if not result["available"]:
+        result.update(review_required=True, product_scope_differs=None,
+                      next_action="当前公司配置不可读；先恢复配置再核对范围。已保存任务和历史客户未改动。")
+        return result
+    config = core.read_json(config_path)
+    defaults = config.get("task_defaults", {})
+    core.require(isinstance(defaults, dict), "config.task_defaults must be an object")
+    current = {"products": copy.deepcopy(defaults.get("products", config.get("products", core.PRIMARY_PRODUCTS))),
+               "supplementary_products": copy.deepcopy(defaults.get("supplementary_products", [] if "products" in defaults else config.get("supplementary_products", [])))}
+    # Match snapshot's filtering of inherited incidental products, without
+    # changing explicit task defaults or rewriting historical configuration.
+    if "supplementary_products" not in defaults:
+        core.string_list(current["supplementary_products"], "Company supplementary_products")
+        current["supplementary_products"] = [p for p in current["supplementary_products"] if p not in current["products"]]
+    core.validate_product_scope(current)
+    differences = {}
+    for key, values in current.items():
+        saved = result["task_scope"][key]
+        core.string_list(saved, "Saved task." + key)
+        if set(saved) != set(values):
+            differences[key] = {"task": saved, "current_defaults": values,
+                                "only_in_task": sorted(set(saved) - set(values)),
+                                "only_in_defaults": sorted(set(values) - set(saved))}
+    profile_defaults = defaults.get("customer_profile", {})
+    core.require(isinstance(profile_defaults, dict), "config.task_defaults.customer_profile must be an object")
+    current_brand = profile_defaults.get("brand_policy", config.get("brand_policy", "independent_product"))
+    current_policy = {"brand_policy": current_brand,
+                      "collect_brand_stores": profile_defaults.get("collect_brand_stores", config.get("collect_brand_stores", current_brand == "independent_product")),
+                      "collection_strategy": defaults.get("collection_strategy", config.get("collection_strategy", "market_sequence"))}
+    task_policy = {"brand_policy": core.brand_policy(task),
+                   "collect_brand_stores": task.get("customer_profile", {}).get("collect_brand_stores", False),
+                   "collection_strategy": task.get("collection_strategy", "legacy")}
+    policy_differences = {key: {"task": task_policy[key], "current_defaults": value}
+                          for key, value in current_policy.items() if task_policy[key] != value}
+    versions["config_declared"] = config.get("rules_version")
+    mismatches = {key: value for key, value in versions.items() if key != "runtime" and value is not None and value != core.VERSION}
+    recorded_sha = task_context.get("config_sha256")
+    file_changed = core.digest_bytes(config_path.read_bytes()) != recorded_sha if recorded_sha else None
+    result.update(current_defaults=current, product_scope_differs=bool(differences), differences=differences,
+                  task_policy=task_policy, current_policy=current_policy, policy_differences=policy_differences,
+                  policy_scope_differs=bool(policy_differences),
+                  configuration_file_changed_since_task=file_changed,
+                  versions_differ_from_runtime=mismatches, review_required=bool(differences or policy_differences or mismatches or file_changed),
+                  interpretation="任务与默认范围的差异可能来自专项要求；配置文件哈希或版本差异不单独证明业务范围变化。",
+                  next_action="明确继续时沿用已保存任务范围、品牌政策、市场策略与原预算；本次要求采用新规则时，用 snapshot 建立新任务并明确地区，不改写旧任务或历史资格。" if differences or policy_differences or mismatches or file_changed else "当前默认与任务范围及政策一致；按活动任务接续。")
+    return result
+
+
 def status(root, batch_id=None):
     """Resolve an explicit selection or active pointer; never guess among tasks."""
     with core.locked(root):
@@ -288,6 +354,7 @@ def status(root, batch_id=None):
         result = {"task_found": True, "selection_required": False, "batch_id": batch_id, "committed": saved is not None,
                   "task": copy.deepcopy(saved["task"] if saved else packet["task"]), "latest_delivery": index["tasks"].get(batch_id, {}).get("latest_delivery"),
                   "next_action": "start a continuation batch" if saved else "resume saved research"}
+        result["configuration_review"] = _configuration_review(root, result["task"])
     try:
         import leadkit_research as research
     except ModuleNotFoundError as exc:
@@ -305,7 +372,9 @@ def continue_task(root, batch_id=None, new_batch_id=None):
     batch_id = selected["batch_id"]
     if not selected["committed"]:
         core.require(new_batch_id is None, "Uncommitted task resumes its existing batch; new-batch-id applies after commit")
-        return dict(resume(root, batch_id), continued_from=batch_id, created=False, research=selected.get("research"))
+        resumed = resume(root, batch_id)
+        return dict(resumed, continued_from=batch_id, created=False, research=selected.get("research"),
+                    configuration_review=_configuration_review(root, resumed["packet"]["task"]))
     with core.locked(root):
         master, _ = core.load_master(root)
         previous = copy.deepcopy(master["batches"][batch_id])
@@ -324,8 +393,9 @@ def continue_task(root, batch_id=None, new_batch_id=None):
     task["target_metric"] = metric
     if remaining is None:
         baseline = core.read_json(root / "research" / batch_id / "snapshot.json")
-        qualified = [x for x in previous.get("lead_snapshots", []) if x.get("status") == "main" and not x.get("canonical_id")]
-        counts = {"new_qualified": previous.get("counts", {}).get("new_qualified_entities", sum(x["lead_id"] not in baseline["lead_ids"] for x in qualified)),
+        qualified = [x for x in previous.get("lead_snapshots", []) if core.is_independent_main(x, task) and not x.get("canonical_id")]
+        count_key = "new_independent_qualified_entities" if core.brand_policy(task) == "independent_product" else "new_qualified_entities"
+        counts = {"new_qualified": previous.get("counts", {}).get(count_key, sum(x["lead_id"] not in baseline["lead_ids"] for x in qualified)),
                   "qualified": len(qualified), "updated": previous.get("counts", {}).get("updated_entities", 0)}
         remaining = max(0, task.get("target_count", 20) - counts[metric])
     if isinstance(remaining, int) and not isinstance(remaining, bool) and remaining > 0:
@@ -349,9 +419,10 @@ def continue_task(root, batch_id=None, new_batch_id=None):
     else:
         carried = research.carry_forward(root, batch_id, new_batch_id)
     result = dict(created, created=True, committed=False, continued_from=batch_id, packet=packet, carried_research=carried,
-                  next_action="Research the continuation batch, checkpoint progress, validate and commit before exporting", budget_policy="per_batch")
+                  next_action="Research the continuation batch, checkpoint progress, validate and commit before exporting", budget_policy="per_batch",
+                  configuration_review=selected["configuration_review"])
     if task["collection_strategy"] == "legacy":
-        result["strategy_note"] = "历史任务保留原准入规则；开始系统扩采前，先补建区域渠道、当地联系方式和路线计划，再显式启用 region_size_ladder。"
+        result["strategy_note"] = "历史任务保留原准入规则和策略；采用当前新规则时另建 market_sequence 任务，先补国家、城市、市场目录及顺序、当地渠道和联系生态，再逐市场采集。"
     return result
 
 
@@ -391,7 +462,8 @@ def setup_project(root, dedicated=False):
             '先读取该技能 SKILL.md 和项目根 .customer-development-project.json；用 leadkit_project.py inspect 定位唯一主库、公司配置、当前有效规则及补充查重源。换窗口仍使用同一绑定，不新建空库，也不把旧批规则当当前规则。',
             'JSON主库按已绑定工作区 execution/task-index.json 定位任务并用 workflow continue接续；Excel主库按原表稳定ID、记录和断点增量处理，不迁移或初始化第二套JSON主库。',
             '新增客户必须对照主库和全部补充查重源；仅安装技能不共享历史数据，缺少文件不得宣称企业净新增。',
-            '先完成当地渠道与联系生态预研，再按有据的大型、中型、小型路线逐层建立商户池；优先批发、进口、分销与市场商户，再相关零售和电商卖家。',
+            '新采集任务先按国家→城市／地区→批发市场／批发城建立有来源的目录并完成当前城市渠道与联系生态预研，再按有据的市场优先顺序逐个采集场内商户；目录只说明已研究范围，不把局部目录当作全国完整目录。历史任务保留其已冻结策略，新规则另建任务接续。',
+            '当前市场的已观察目录和所有已见入口完成后，才在下一批推进第二、第三市场；预算用尽继续当前市场，未读、受阻或暂缓均不算完成，不静默跳市场。每个市场独立交付 Excel，独立商户与品牌店分列；市场归属待核的主体保留待核，不冒入场内正式客户。',
             '员工主要接收最终客户 Excel、数量与必要限制；内部步骤和校验保存在本地。未核实证据不得伪造成客户，必须执行技能的准备、资格、去重和提交校验。',
             '此项目只做客户研究，不发送消息；员工纠错后按当前状态导出新表，历史交付保持不变。',
             MANAGED_END,
@@ -416,16 +488,25 @@ def setup_project(root, dedicated=False):
     return {"instructions_path": str(path), "backup_path": str(backup) if backup else None, "changed": updated != original, "next_action": "Employees can enter natural customer-research requests in this project"}
 
 
-def _subset(packet, leads, master_ids=()):
+def _subset(packet, leads, master_ids=(), master_sources=None):
     result = copy.deepcopy(packet)
     result["leads"] = copy.deepcopy(leads)
     ids = {x.get("lead_id") for x in leads if isinstance(x, dict)}
+    sources = dict(master_sources or {})
+    sources.update({s["source_id"]: s for s in packet.get("sources", []) if isinstance(s, dict) and s.get("source_id")})
+    def supports(lead, product):
+        try:
+            return core.is_independent_main(lead, packet["task"]) and product in core.matched_products(lead, packet["task"], sources)
+        except (KeyError, TypeError, AttributeError):
+            # Malformed candidates are isolated by validate(), never promoted
+            # while computing a provisional subset's coverage.
+            return False
     for cell in result.get("coverage", []):
         if isinstance(cell, dict):
             cell["discovered_lead_ids"] = [x for x in cell.get("discovered_lead_ids", []) if x in ids]
             if cell.get("status") == "searched":
                 found = set(cell["discovered_lead_ids"])
-                qualified = any(x.get("lead_id") in found and x.get("status") == "main" and cell.get("product") in ({e.get("product") for e in x.get("product_evidence", []) if isinstance(e, dict)} & {e.get("product") for e in x.get("white_label_evidence", []) if isinstance(e, dict)}) for x in leads if isinstance(x, dict))
+                qualified = any(x.get("lead_id") in found and supports(x, cell.get("product")) for x in leads if isinstance(x, dict))
                 if not qualified:
                     cell["status"] = "searched_zero"
                     cell.setdefault("limitations", []).append("本准备文件仅统计保留记录，当前格无合格客户；完整原始覆盖见 original.json。")
@@ -456,7 +537,7 @@ def prepare(root, packet, output_dir):
             for cell in packet["coverage"]:
                 core.string_list(cell.get("discovered_lead_ids", []), "coverage.discovered_lead_ids")
                 core.require(set(cell.get("discovered_lead_ids", [])) <= original_ids, "coverage references lead outside original packet")
-            shared = _subset(packet, [], master["leads"])
+            shared = _subset(packet, [], master["leads"], master["sources"])
             shared_sources = core.validate_packet(shared, master)
             core.validate_issues(packet["queue"], shared_sources, "queue")
         except (core.LeadkitError, ValueError, TypeError, KeyError) as exc:
@@ -481,7 +562,7 @@ def prepare(root, packet, output_dir):
             def accept(indices):
                 trial = [raw_leads[i] for i in sorted(selected | set(indices))]
                 try:
-                    validate(_subset(packet, trial, master["leads"]), master)
+                    validate(_subset(packet, trial, master["leads"], master["sources"]), master)
                 except (core.LeadkitError, ValueError, TypeError, KeyError) as exc:
                     for i in indices:
                         failures[i] = str(exc)
@@ -532,7 +613,7 @@ def prepare(root, packet, output_dir):
             rejected = [{"index": i, "lead_id": lead.get("lead_id") if isinstance(lead, dict) else None, "error": failures.get(i, "Unresolved relationship dependency"), "record": copy.deepcopy(lead)} for i, lead in enumerate(raw_leads) if i not in selected]
         else:
             rejected = [{"index": i, "lead_id": x.get("lead_id") if isinstance(x, dict) else None, "error": "Shared validation blocked", "record": copy.deepcopy(x)} for i, x in enumerate(raw_leads)]
-        prepared = _subset(packet, accepted, master["leads"]) if not errors else copy.deepcopy(packet)
+        prepared = _subset(packet, accepted, master["leads"], master["sources"]) if not errors else copy.deepcopy(packet)
         repairs = []
         for index, item in enumerate(rejected):
             issue = {"issue_id": "REPAIR-" + core.digest_bytes(core.encoded([packet.get("batch_id"), item["index"], item["record"]]))[:20], "kind": "validation", "detail": item["error"], "state": "open", "next_action": "Correct the preserved rejected record, then prepare a new batch against the current baseline", "attempts": 1, "next_trigger": "record_corrected", "source_ids": []}

@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
 
-VERSION = "1.3.1"
+VERSION = "1.5.0"
 PRIMARY_PRODUCTS = ["智能眼镜", "智能手表", "智能手表表带", "智能手环", "智能戒指"]
 SUPPLEMENTARY_PRODUCTS = ["蓝牙耳机", "蓝牙音响"]
 PRODUCTS = PRIMARY_PRODUCTS + SUPPLEMENTARY_PRODUCTS
@@ -28,9 +28,10 @@ LEVELS = {"current_original", "cached_original", "third_party_original", "search
 STRONG = {"current_original", "cached_original", "third_party_original"}
 CONTACTS = {"phone", "whatsapp", "email", "website", "form", "facebook", "instagram", "telegram", "tiktok", "youtube", "linkedin", "zalo", "chat", "other"}
 PLATFORMS = {"facebook.com", "instagram.com", "t.me", "telegram.me", "youtube.com", "youtu.be", "tiktok.com", "linkedin.com", "wa.me", "whatsapp.com", "google.com", "maps.google.com"}
-BRANDS = {"white_label", "mixed", "brand_owner", "official_store", "brand_exclusive", "unknown"}
-BRAND_LABELS = {"white_label": "白牌经营", "mixed": "品牌／白牌混合经营", "brand_owner": "品牌方", "official_store": "官方品牌店", "brand_exclusive": "品牌专卖店", "unknown": "品牌类型待核"}
+BRANDS = {"independent", "white_label", "mixed", "brand_owner", "official_store", "brand_exclusive", "unknown"}
+BRAND_LABELS = {"independent": "独立商户", "white_label": "白牌经营", "mixed": "品牌／白牌混合经营", "brand_owner": "品牌方", "official_store": "官方品牌店", "brand_exclusive": "品牌专卖店", "unknown": "品牌类型待核"}
 EXCLUDED_BRANDS = {"brand_owner", "official_store", "brand_exclusive"}
+BRAND_STORES = {"official_store", "brand_exclusive"}
 CAPABILITIES = {"wholesale", "import", "distribution", "sales_capacity"}
 BLOCKING_ISSUES = {"identity_conflict", "location_conflict", "white_label_conflict", "product_conflict", "buyer_conflict", "contact_conflict", "employee_correction"}
 ENTITY_ISSUES = {"identity_conflict", "contact_conflict"}
@@ -51,7 +52,7 @@ class LeadkitError(Exception):
 
 
 def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def encoded(value):
@@ -133,7 +134,7 @@ def init_workspace(root):
         require(not any(p.exists() or p.is_symlink() for p in reserved), "init refuses to overwrite an existing project; choose a new workspace")
         for name in ("execution", "research", "outputs"):
             (root / name).mkdir()
-        config = {"schema_version": 1, "products": PRIMARY_PRODUCTS, "supplementary_products": SUPPLEMENTARY_PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "preferred_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户"], "business_priorities": ["buyer_type"], "brand_policy": "white_label_required", "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "supplier_constraints": {}, "activity_max_age_days": 180, "rules_version": VERSION}
+        config = {"schema_version": 1, "products": PRIMARY_PRODUCTS, "supplementary_products": SUPPLEMENTARY_PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "preferred_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户"], "business_priorities": ["buyer_type"], "brand_policy": "independent_product", "collect_brand_stores": True, "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "supplier_constraints": {}, "activity_max_age_days": 180, "rules_version": VERSION}
         safe_write(root / "config.json", config)
         master = {"schema_version": 1, "created_at": now(), "updated_at": now(), "leads": {}, "sources": {}, "batches": {}}
         safe_write(root / "execution" / "master.json", master)
@@ -155,7 +156,7 @@ def basic_snapshot(root, batch_id):
         target.mkdir()
         baseline = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "created_at": now(), "lead_ids": sorted(master["leads"])}
         safe_write(target / "snapshot.json", baseline)
-        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRIMARY_PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "white_label_required", "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
+        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRIMARY_PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "independent_product", "collect_brand_stores": True, "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
         safe_write(target / "batch.json", packet)
     return {"batch_id": batch_id, "base_sha256": sha, "batch_path": str(target / "batch.json"), "snapshot_path": str(target / "snapshot.json")}
 
@@ -259,7 +260,8 @@ def derive_priority(lead, sources, task=None):
     if capability and recent_activity(activity, (task or {}).get("activity_max_age_days", 180)) and any(sources[s]["level"] in CURRENT for s in activity.get("source_ids", [])):
         ids = sorted({s for x in capability for s in x["source_ids"]} | set(activity["source_ids"]))
         return "A", "已通过准入；经营能力：%s；持续经营：%s [%s]" % ("；".join(x["detail"] for x in capability), activity["detail"], " ".join(ids))
-    return "B", "已通过产品、白牌、主体、地域、客户类型和联系入口准入；经营能力或持续经营依据尚不齐全，不推定采购规模"
+    gates = "产品、白牌、主体、地域、客户类型和联系入口" if brand_policy(task or {}) == "white_label_required" else "产品、主体、地域、客户类型和联系入口"
+    return "B", "已通过" + gates + "准入；经营能力或持续经营依据尚不齐全，不推定采购规模"
 
 
 def derive_business_priority(lead, sources, task):
@@ -299,7 +301,9 @@ def validate_packet(packet, master):
     require(isinstance(profile, dict), "task.customer_profile is required")
     string_list(profile.get("buyer_types"), "customer_profile.buyer_types")
     require(bool(profile["buyer_types"]) and all(x.strip() for x in profile["buyer_types"]), "customer_profile.buyer_types cannot be empty")
-    require(profile.get("brand_policy") == "white_label_required", "customer_profile.brand_policy must be white_label_required")
+    require(profile.get("brand_policy") in {"white_label_required", "independent_product"}, "Invalid customer_profile.brand_policy")
+    require(type(profile.get("collect_brand_stores", False)) is bool, "customer_profile.collect_brand_stores must be boolean")
+    require(brand_policy(task) != "white_label_required" or not profile.get("collect_brand_stores", False), "white_label_required cannot collect brand stores")
     require(isinstance(profile.get("supplier_constraints"), dict), "customer_profile.supplier_constraints must be an object; leave unknown terms unset")
     import leadkit_research as research
     research.validate_policy(task)
@@ -351,10 +355,11 @@ def validate_packet(packet, master):
         main = lead["status"] == "main"
         brand = lead.get("brand_profile", "unknown")
         require(brand in BRANDS, "Invalid brand_profile")
-        if brand in EXCLUDED_BRANDS:
-            require(lead["status"] == "excluded", "Brand owners, official stores and brand-exclusive stores must be excluded")
+        if brand in excluded_brands(task):
+            require(lead["status"] == "excluded", "This brand profile must be excluded under the saved task policy")
         if main:
-            require(brand in {"white_label", "mixed"}, "main needs white_label or mixed brand_profile with evidence")
+            allowed_brands = {"white_label", "mixed"} if brand_policy(task) == "white_label_required" else {"independent", "white_label", "mixed"} | (BRAND_STORES if profile.get("collect_brand_stores", False) else set())
+            require(brand in allowed_brands, "main needs a supported brand_profile identifying an independent merchant or allowed brand store")
             require(any(r["country"] == lead["country"] and r["status"] != "blocked" for r in packet["region_research"]), "main needs non-blocked region_research for its actual country")
             require(lead.get("buyer_type") in profile["buyer_types"], "main buyer_type must match customer_profile.buyer_types")
         refs(lead.get("buyer_type_source_ids", []), "buyer_type_source_ids", sources, strong=main, required=main)
@@ -387,7 +392,7 @@ def validate_packet(packet, master):
             refs(item.get("source_ids", []), "white_label_evidence.source_ids", sources)
             if any(sources[x]["level"] in STRONG for x in item["source_ids"]):
                 white_products.add(item["product"])
-        if main:
+        if main and brand_policy(task) == "white_label_required":
             require(bool(matching & white_products), "main needs readable white_label_evidence for the same requested product")
         capability = lead.get("capability_evidence", [])
         require(isinstance(capability, list), "capability_evidence must be an array")
@@ -464,16 +469,65 @@ def task_scopes(task):
     return scopes
 
 
+def brand_policy(task):
+    # Missing policy is historical data, never a request to apply new defaults.
+    return task.get("customer_profile", {}).get("brand_policy", "white_label_required")
+
+
+def excluded_brands(task):
+    if brand_policy(task) == "independent_product" and task.get("customer_profile", {}).get("collect_brand_stores", False):
+        return {"brand_owner"}
+    return EXCLUDED_BRANDS
+
+
+def collection_segment(lead, task):
+    """Classification is separate from qualification and never user-assigned."""
+    if lead.get("brand_profile") in BRAND_STORES:
+        return "brand_store"
+    if lead.get("brand_profile") in {"independent", "white_label", "mixed"}:
+        return "independent"
+    return "unclassified"
+
+
+def is_independent_main(lead, task):
+    return lead.get("status") == "main" and collection_segment(lead, task) == "independent"
+
+
+def result_counts(leads, task):
+    counts = {status: sum(x["status"] == status for x in leads) for status in ("main", "candidate", "excluded")}
+    if brand_policy(task) == "independent_product":
+        counts.update(independent_main=sum(is_independent_main(x, task) for x in leads),
+                      brand_store_main=sum(x["status"] == "main" and collection_segment(x, task) == "brand_store" for x in leads))
+    return counts
+
+
 def scope_key(task):
     # Request wording, run dates and target counts must not create new eligibility scopes.
-    dimensions = {"geo_scope": sorted([{k: normalized(v) for k, v in s.items()} for s in task_scopes(task)], key=lambda x: json.dumps(x, sort_keys=True)), "products": sorted(task["products"]), "buyer_types": sorted(task["customer_profile"]["buyer_types"]), "requirements": sorted(task["requirements"]), "supplier_constraints": task["customer_profile"].get("supplier_constraints", {}), "brand_policy": "white_label_required"}
+    dimensions = {"geo_scope": sorted([{k: normalized(v) for k, v in s.items()} for s in task_scopes(task)], key=lambda x: json.dumps(x, sort_keys=True)), "products": sorted(task["products"]), "buyer_types": sorted(task["customer_profile"]["buyer_types"]), "requirements": sorted(task["requirements"]), "supplier_constraints": task["customer_profile"].get("supplier_constraints", {}), "brand_policy": brand_policy(task)}
+    if brand_policy(task) != "white_label_required":
+        dimensions["collect_brand_stores"] = task["customer_profile"].get("collect_brand_stores", False)
     return "scope-" + digest_bytes(encoded(dimensions))[:24]
 
 
 def matched_products(lead, task, sources):
     def available(group):
         return {x["product"] for x in lead.get(group, []) if any(sources[s]["level"] in STRONG for s in x.get("source_ids", []))}
-    return sorted(set(task.get("products", [])) & available("product_evidence") & available("white_label_evidence"))
+    products = set(task.get("products", [])) & available("product_evidence")
+    if brand_policy(task) == "white_label_required":
+        products &= available("white_label_evidence")
+    return sorted(products)
+
+
+def white_label_review(lead, task, sources):
+    """Report only this task's sourced products; historical merged facts do not qualify."""
+    products = set(matched_products(lead, dict(task, customer_profile=dict(task.get("customer_profile", {}), brand_policy="independent_product")), sources))
+    products &= {x["product"] for x in lead.get("white_label_evidence", []) if any(sources[s]["level"] in STRONG for s in x.get("source_ids", []))}
+    for issue in lead.get("issues", []):
+        if issue.get("kind") == "white_label_conflict" and issue.get("state") != "resolved":
+            if issue.get("affected_scope_ids") and scope_key(task) not in issue["affected_scope_ids"]:
+                continue
+            products -= set(issue.get("affected_products", products))
+    return {"white_label_status": "verified" if products else "unverified", "white_label_products": sorted(products)}
 
 
 def validate_issues(items, sources, label):
@@ -506,6 +560,8 @@ def validate_issues(items, sources, label):
 def issue_blocks(issue, task, scope_id=None):
     """Identity/contact ownership conflicts concern the entity, not one product."""
     if issue.get("state") == "resolved" or not (issue.get("blocks_qualification") or issue.get("kind") in BLOCKING_ISSUES):
+        return False
+    if issue.get("kind") == "white_label_conflict" and brand_policy(task) == "independent_product":
         return False
     if issue.get("kind") in ENTITY_ISSUES:
         return True
@@ -669,7 +725,8 @@ def validate_v3(packet, master, sources):
                 nonempty(exclusion.get("user_instruction"), "exclusion.user_instruction")
             else:
                 refs(exclusion.get("source_ids", []), "exclusion.source_ids", sources, strong=True)
-            if lead.get("brand_profile") in EXCLUDED_BRANDS:
+            require(exclusion["code"] not in BRAND_STORES or exclusion["code"] in excluded_brands(task), "This task collects brand stores; use the actual disqualifying condition or explicit user exclusion")
+            if lead.get("brand_profile") in excluded_brands(task):
                 require(exclusion["code"] == lead["brand_profile"] or exclusion["code"] == "user_excluded", "exclusion.code must match brand fact")
         canonical = lead.get("canonical_id")
         if canonical:
@@ -881,16 +938,21 @@ def merged_lead(old, incoming, packet, sources, stamp):
     lead = copy.deepcopy(old or {})
     lead.update(copy.deepcopy(incoming))
     key = scope_key(packet["task"])
-    if lead.get("brand_profile") in EXCLUDED_BRANDS:
+    if lead.get("brand_profile") in excluded_brands(packet["task"]):
         require(incoming["status"] == "excluded", "Merged brand profile is excluded; explicitly correct brand_profile with evidence")
     old_exclusion = (old or {}).get("global_exclusion")
     if not old_exclusion and (old or {}).get("exclusion", {}).get("code") in EXCLUDED_BRANDS | {"closed"}:
         old_exclusion = old["exclusion"]
+    if not old_exclusion and (old or {}).get("brand_profile") in BRAND_STORES and incoming.get("brand_profile") not in BRAND_STORES:
+        old_exclusion = {"code": old["brand_profile"], "source_ids": sorted(lead_source_ids(old))}
     prior_scope = (old or {}).get("qualifications", {}).get(key, {})
     if not old_exclusion and prior_scope.get("status") == "excluded":
         old_exclusion = prior_scope.get("evidence_snapshot", {}).get("exclusion") or (old or {}).get("exclusion") or {"source_ids": prior_scope.get("source_ids", [])}
     if incoming["status"] != "excluded":
-        if old_exclusion:
+        policy_allows_prior_store = (old_exclusion and old_exclusion.get("code") in BRAND_STORES
+                                    and incoming.get("brand_profile") in BRAND_STORES
+                                    and incoming["brand_profile"] not in excluded_brands(packet["task"]))
+        if old_exclusion and not policy_allows_prior_store:
             resolution = incoming.get("exclusion_resolution", {})
             nonempty(resolution.get("detail"), "exclusion_resolution.detail required to replace prior exclusion")
             refs(resolution.get("source_ids", []), "exclusion_resolution.source_ids", sources, strong=True)
@@ -927,6 +989,11 @@ def merged_lead(old, incoming, packet, sources, stamp):
     priority, reason = derive_priority(incoming, sources, packet["task"])
     business = derive_business_priority(incoming, sources, packet["task"])
     qualifications[key] = {"status": incoming["status"], "priority": priority, "priority_reason": reason, "business_priority": business, "qualified_products": matched_products(incoming, packet["task"], sources) if incoming["status"] == "main" else [], "task": copy.deepcopy(packet["task"]), "batch_id": bid, "updated_at": stamp, "reason": incoming["reason"], "source_ids": sorted(lead_source_ids(incoming)), "evidence_snapshot": {k: copy.deepcopy(v) for k, v in incoming.items() if k not in {"history", "qualifications", "global_exclusion"}}}
+    review_issues = lead["issues"] + [q for q in packet.get("queue", []) if q.get("lead_id") == incoming["lead_id"]]
+    derived = dict(white_label_review(dict(incoming, issues=review_issues), packet["task"], sources), collection_segment=collection_segment(incoming, packet["task"]))
+    qualifications[key].update(copy.deepcopy(derived))
+    qualifications[key]["evidence_snapshot"].update(copy.deepcopy(derived))
+    lead.update(derived)
     lead["qualifications"] = qualifications
     lead["last_task_status"] = incoming["status"]
     lead["last_scope_id"] = key
@@ -936,10 +1003,17 @@ def merged_lead(old, incoming, packet, sources, stamp):
         lead["global_exclusion"] = copy.deepcopy(incoming["exclusion"])
         # A confirmed closed or brand-only entity cannot retain actionable old qualification.
         for qkey, qualification in qualifications.items():
-            if qkey != key and qualification["status"] == "main":
+            incompatible = (incoming["exclusion"]["code"] == "closed"
+                            or incoming["exclusion"]["code"] in excluded_brands(qualification.get("task", {}))
+                            or collection_segment(qualification.get("evidence_snapshot", {}), qualification.get("task", {})) != "brand_store")
+            if qkey != key and qualification["status"] == "main" and incompatible:
                 qualification.update(status="candidate", priority="", requires_review=True, reason="主体事实变化，历史资格待复核")
     elif incoming["status"] == "main":
         lead.pop("global_exclusion", None)
+        for qkey, qualification in qualifications.items():
+            prior_segment = collection_segment(qualification.get("evidence_snapshot", {}), qualification.get("task", {}))
+            if qkey != key and qualification["status"] == "main" and prior_segment in {"independent", "brand_store"} and prior_segment != derived["collection_segment"]:
+                qualification.update(status="candidate", priority="", requires_review=True, reason="商户经营身份已有新证据，原范围须复核独立商户／品牌店归类")
     if not any(actionable_contact(c, sources) for c in lead["contacts"]):
         for qualification in qualifications.values():
             if qualification["status"] == "main":
@@ -949,7 +1023,7 @@ def merged_lead(old, incoming, packet, sources, stamp):
             qualification.update(status="candidate", priority="", requires_review=True, reason="关键资格事实冲突，待证据解决")
     # Compatibility field is aggregate, not the latest task decision.
     states = [q["status"] for q in qualifications.values() if not q.get("requires_review")]
-    lead["status"] = "excluded" if lead.get("canonical_id") or lead.get("global_exclusion") else ("main" if "main" in states else "candidate" if "candidate" in states else incoming["status"])
+    lead["status"] = "excluded" if lead.get("canonical_id") or lead.get("global_exclusion", {}).get("code") in {"brand_owner", "closed"} else ("main" if "main" in states else "candidate" if "candidate" in states else incoming["status"])
     lead["priority"], lead["priority_reason"] = priority, reason
     lead["business_priority"] = business
     lead["qualified_products"] = qualifications[key]["qualified_products"]
@@ -960,9 +1034,10 @@ def merged_lead(old, incoming, packet, sources, stamp):
 def prepare_validation(packet, master):
     sources = validate_packet(packet, master)
     proposed = copy.deepcopy(master["leads"])
-    for incoming in packet["leads"]:
-        proposed[incoming["lead_id"]] = merged_lead(proposed.get(incoming["lead_id"]), incoming, packet, sources, now())
     queue = merge_issues(master.get("queue", []), packet["queue"])
+    review_packet = dict(packet, queue=queue)
+    for incoming in packet["leads"]:
+        proposed[incoming["lead_id"]] = merged_lead(proposed.get(incoming["lead_id"]), incoming, review_packet, sources, now())
     for incoming in packet["leads"]:
         if incoming["status"] == "main":
             blocking = [q for q in queue if q.get("lead_id") == incoming["lead_id"] and issue_blocks(q, packet["task"])]
@@ -976,7 +1051,7 @@ def prepare_validation(packet, master):
                 changed = True
         if changed:
             states = [q["status"] for q in lead["qualifications"].values() if not q.get("requires_review")]
-            lead["status"] = "excluded" if lead.get("canonical_id") or lead.get("global_exclusion") else "main" if "main" in states else "candidate"
+            lead["status"] = "excluded" if lead.get("canonical_id") or lead.get("global_exclusion", {}).get("code") in {"brand_owner", "closed"} else "main" if "main" in states else "candidate"
             if lead["status"] != "main":
                 lead["priority"] = ""
     hints = duplicate_hints(proposed, [x["lead_id"] for x in packet["leads"]])
@@ -1036,8 +1111,10 @@ def commit(root, packet):
         require(baseline.get("base_sha256") == packet["base_sha256"], "Batch snapshot does not match. Create a new batch after reconciliation")
         require(baseline.get("batch_id") == bid, "Snapshot batch ID mismatch")
         stamp = now()
-        counts = {status: sum(x["status"] == status for x in packet["leads"]) for status in ("main", "candidate", "excluded")}
+        counts = result_counts(packet["leads"], packet["task"])
         counts.update(new_entities=0, new_qualified_entities=0, updated_entities=0, first_qualified=0, requalified=0, new_contacts=0, new_sources=len([s for s in packet["sources"] if s["source_id"] not in master["sources"]]))
+        if brand_policy(packet["task"]) == "independent_product":
+            counts.update(new_independent_qualified_entities=0, new_brand_store_entities=0)
         key = scope_key(packet["task"])
         snapshots = []
         for incoming in packet["leads"]:
@@ -1048,6 +1125,8 @@ def commit(root, packet):
                 counts["new_entities"] += 1
                 if incoming["status"] == "main":
                     counts["new_qualified_entities"] += 1
+                    if brand_policy(packet["task"]) == "independent_product":
+                        counts["new_independent_qualified_entities" if is_independent_main(incoming, packet["task"]) else "new_brand_store_entities"] += 1
             elif old and not lead.get("canonical_id"):
                 counts["updated_entities"] += 1
             if incoming["status"] == "main" and key not in (old or {}).get("qualifications", {}):
@@ -1198,7 +1277,7 @@ def lead_source_ids(lead):
         result.update(contact["source_ids"])
         result.update(contact.get("whatsapp_source_ids", []))
         result.update(contact.get("action_source_ids", []))
-    for field in ("exclusion", "exclusion_resolution", "procurement_access", "relationship_evidence", "location_match"):
+    for field in ("exclusion", "exclusion_resolution", "procurement_access", "relationship_evidence", "location_match", "market_assignment"):
         result.update(lead.get(field, {}).get("source_ids", []))
     for group in ("issues", "discovered_by", "requirement_checks", "supplier_fit"):
         for item in lead.get(group, []):
@@ -1264,7 +1343,9 @@ def current_scope_view(master, scope_id):
             reasons.append("存在未解决的关键资格冲突")
         if not any(actionable_contact(c, master["sources"]) for c in lead.get("contacts", [])):
             reasons.append("当前没有已核可操作联系入口")
-        if entity.get("canonical_id") or entity.get("entity_status") in {"closed", "merged"} or entity.get("global_exclusion") or entity.get("brand_profile") in EXCLUDED_BRANDS:
+        global_exclusion = entity.get("global_exclusion", {})
+        exclusion_applies = bool(global_exclusion) and not (global_exclusion.get("code") in BRAND_STORES and global_exclusion["code"] not in excluded_brands(task))
+        if entity.get("canonical_id") or entity.get("entity_status") in {"closed", "merged"} or exclusion_applies or entity.get("brand_profile") in excluded_brands(task):
             lead["status"] = "excluded"
         elif reasons and lead["status"] == "main":
             lead["status"] = "candidate"
@@ -1273,6 +1354,7 @@ def current_scope_view(master, scope_id):
         lead["qualified_products"] = matched_products(lead, task, master["sources"]) if lead["status"] == "main" else []
         lead["priority"], lead["priority_reason"] = derive_priority(lead, master["sources"], task)
         lead["business_priority"] = derive_business_priority(lead, master["sources"], task)
+        lead.update(white_label_review(lead, task, master["sources"]), collection_segment=collection_segment(lead, task))
         lead["qualification_batch_id"] = qualification.get("batch_id", "")
         result.append(lead)
     return result
@@ -1294,7 +1376,7 @@ def export_current(root, output, scope_id=None, batch_id=None):
     view = copy.deepcopy(reference)
     leads = current_scope_view(master, scope_id)
     view.update(view="current", lead_snapshots=leads, committed_at=now(), source_ids=[],
-                counts={status: sum(x["status"] == status for x in leads) for status in ("main", "candidate", "excluded")})
+                counts=result_counts(leads, reference["task"]))
     view["limitations"] = append_unique(view.get("limitations", []), ["当前视图按各资格范围原证据与主库当前状态重建；不会重新联网核实。历史批次及历史导出保持不变。"])
     view["queue"] = [q for q in master.get("queue", []) if q.get("lead_id") in {x["lead_id"] for x in leads}]
     result = export_view(master, view, batch_id, output)
@@ -1304,6 +1386,8 @@ def export_current(root, output, scope_id=None, batch_id=None):
 def export_view(master, batch, batch_id, output):
     leads = batch["lead_snapshots"]
     legacy = batch.get("schema_version", 1) < 2
+    independent_policy = not legacy and brand_policy(batch["task"]) == "independent_product"
+    combined_view = batch.get("view") in {"current", "market_delivery"}
     if not legacy:
         leads = sorted(leads, key=lambda x: business_sort_key(x, batch["task"]))
     header = ["客户编号", "商户名称", "国家", "城市", "地址／精度", "经营角色", "匹配产品及证据摘要", "公开业务入口", "适配理由", "待核问题", "来源编号", "人工备注"]
@@ -1312,13 +1396,28 @@ def export_view(master, batch, batch_id, output):
     header += ["业务适配依据", "本次业务排序偏好"]
     widths += [85, 40]
     output_rows = {"main": [header], "candidate": [header]}
+    if independent_policy:
+        header += ["白牌核实状态", "本任务已核白牌产品"]
+        widths += [22, 38]
+        output_rows["brand_store"] = [header]
     for lead in leads:
         if lead["status"] not in output_rows:
             continue
+        row_group = "brand_store" if independent_policy and lead["status"] == "main" and collection_segment(lead, batch["task"]) == "brand_store" else lead["status"]
+        brand_label = BRAND_LABELS.get(lead.get("brand_profile"), "旧版未评估" if legacy else "品牌类型待核")
+        if independent_policy and collection_segment(lead, batch["task"]) == "independent":
+            brand_label = "独立商户"
         evidence = "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("product_evidence", []))
         contacts = "\n".join(contact_display(x, lead.get("qualification_batch_id", batch_id)) for x in lead.get("contacts", []))
-        output_rows[lead["status"]].append([lead["lead_id"], lead["name"], lead["country"], lead.get("city", ""), lead.get("address", "未知"), lead.get("buyer_type", "未知"), evidence or lead.get("channel_fit", "未知"), contacts, lead["reason"], "\n".join(lead.get("unknowns", [])), " ".join(sorted(lead_source_ids(lead))), lead.get("manual_notes", ""), BRAND_LABELS.get(lead.get("brand_profile"), "旧版未评估" if legacy else "品牌类型待核"), "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("white_label_evidence", [])), lead.get("market_location", "未明确"), (lead.get("ongoing_activity", {}).get("detail", "未明确") + "；日期：" + lead.get("ongoing_activity", {}).get("observed_on", "未公开") + " [" + " ".join(lead.get("ongoing_activity", {}).get("source_ids", [])) + "]"), "旧版未评级" if legacy else (lead.get("priority") or "未评级"), "历史批次，未按1.1规则重新资格核验" if legacy else lead.get("priority_reason", "未评级"), "、".join(lead.get("qualified_products", [])) or "历史未单列", "\n".join("%s：%s；%s" % (x["constraint"], {"matched":"已匹配","unknown":"未知","conflict":"冲突"}[x["status"]], x["detail"]) for x in lead.get("supplier_fit", [])) or "未配置或历史未核对"])
-        output_rows[lead["status"]][-1] += [lead.get("business_priority", {}).get("reason", "历史未单列"), "、".join(batch["task"].get("business_priorities", [])) or "按原A/B顺序；未设置额外业务偏好"]
+        output_rows[row_group].append([lead["lead_id"], lead["name"], lead["country"], lead.get("city", ""), lead.get("address", "未知"), lead.get("buyer_type", "未知"), evidence or lead.get("channel_fit", "未知"), contacts, lead["reason"], "\n".join(lead.get("unknowns", [])), " ".join(sorted(lead_source_ids(lead))), lead.get("manual_notes", ""), BRAND_LABELS.get(lead.get("brand_profile"), "旧版未评估" if legacy else "品牌类型待核"), "\n".join("%s：%s [%s]" % (x["product"], x["detail"], " ".join(x["source_ids"])) for x in lead.get("white_label_evidence", [])), lead.get("market_location", "未明确"), (lead.get("ongoing_activity", {}).get("detail", "未明确") + "；日期：" + lead.get("ongoing_activity", {}).get("observed_on", "未公开") + " [" + " ".join(lead.get("ongoing_activity", {}).get("source_ids", [])) + "]"), "旧版未评级" if legacy else (lead.get("priority") or "未评级"), "历史批次，未按1.1规则重新资格核验" if legacy else lead.get("priority_reason", "未评级"), "、".join(lead.get("qualified_products", [])) or "历史未单列", "\n".join("%s：%s；%s" % (x["constraint"], {"matched":"已匹配","unknown":"未知","conflict":"冲突"}[x["status"]], x["detail"]) for x in lead.get("supplier_fit", [])) or "未配置或历史未核对"])
+        output_rows[row_group][-1] += [lead.get("business_priority", {}).get("reason", "历史未单列"), "、".join(batch["task"].get("business_priorities", [])) or "按原A/B顺序；未设置额外业务偏好"]
+        output_rows[row_group][-1][12] = brand_label
+        if independent_policy:
+            review_lead = dict(lead, issues=lead.get("issues", []) + [q for q in batch.get("queue", []) if q.get("lead_id") == lead["lead_id"]])
+            # Committed snapshots include conflicts known at that batch, including
+            # earlier queue items omitted from the incremental packet itself.
+            review = {k: lead[k] for k in ("white_label_status", "white_label_products")} if all(k in lead for k in ("white_label_status", "white_label_products")) else white_label_review(review_lead, batch["task"], master["sources"])
+            output_rows[row_group][-1] += ["已核" if review["white_label_status"] == "verified" else "待核", "、".join(review["white_label_products"]) or "未取得本任务产品白牌证据"]
     source_rows = [["来源编号", "关联客户", "来源标题", "来源网址", "读取时间", "读取层级", "支持内容", "限制／资料日期"]]
     wanted = set(batch["source_ids"])
     for lead in leads:
@@ -1337,11 +1436,22 @@ def export_view(master, batch, batch_id, output):
     if batch["task"].get("supplementary_products"):
         notes.append(["附带拓展品类", "、".join(batch["task"]["supplementary_products"]) + "；同渠道顺带保留，本轮主线合格数不含仅匹配这些品类的商户"])
     profile = batch["task"].get("customer_profile", {})
+    if independent_policy:
+        counts = result_counts(leads, batch["task"])
+        notes = [row if row[0] != "本轮结果" else ["本轮结果", "独立商户 %d；品牌店另列 %d；待核 %d；后台排除 %d" % tuple(counts[k] for k in ("independent_main", "brand_store_main", "candidate", "excluded"))] for row in notes]
+        notes += [["白牌核实口径", "白牌单独列已核／待核；只有对应本任务产品的强证据支持已核，不影响独立商户产品准入。品牌店单列，不充独立商户阶段目标。"]]
     if batch.get("view") == "current":
         notes += [["导出视图", "当前有效资格；参考批次仅定位范围，不是当时冻结结果"], ["统计口径", "当前主库该范围全部资格的现状，新增数请查历史批次说明"]]
+    elif batch.get("view") == "market_delivery":
+        notes += [["导出视图", "截至参考批次的市场合并交付；仅合并该资格范围截至此批次的已保存市场证据"], ["统计口径", "本市场截至参考批次的去重结果，不是本批增量或当前全部范围资格；新增数请查历史批次说明"]]
     summary = batch.get("research_summary")
+    market_context = batch.get("market_context") or (summary or {}).get("market_sequence", {}).get("active_market") or {}
+    if market_context:
+        state_labels = {"open": "未开始", "active": "采集中", "complete": "已完成登记边界", "blocked": "受阻未完成", "needs_research": "待预研", "deferred": "暂缓未完成"}
+        notes += [["市场所属国家", market_context.get("country", "待核")], ["市场所属城市", market_context.get("city", "待核")], ["本表市场", market_context.get("market", "待定位")], ["市场编号", market_context.get("market_id", "未定位")], ["当前市场状态", state_labels.get(market_context.get("state"), market_context.get("state", "待核"))], ["市场采集边界", market_context.get("boundary", "未明确；不代表全市场穷尽")]]
     if summary:
-        notes += [["本轮阶段目标", "%s：%s" % (summary.get("policy", {}).get("target_metric", "未知"), summary.get("policy", {}).get("target_count", "未知"))], ["实际目标计数", str(summary.get("target_observed", "未记录"))], ["本主库新增合格主体", str(summary.get("counts", {}).get("new_qualified", "未记录"))]]
+        if not combined_view:
+            notes += [["本轮阶段目标", "%s：%s" % (summary.get("policy", {}).get("target_metric", "未知"), summary.get("policy", {}).get("target_count", "未知"))], ["实际目标计数", str(summary.get("target_observed", "未记录"))], ["本主库新增合格主体", str(summary.get("counts", {}).get("new_qualified", "未记录"))]]
         if summary.get("scope_completion"):
             notes.append(["渠道覆盖完成情况", "阶段结果；仍有未研究类别或未完成路线" if summary["scope_completion"] == "partial" else "已完成本次登记的路线边界，不代表全城或互联网穷尽"])
             notes.append(["未完成路线", "、".join(summary.get("unfinished_routes", [])) or "无登记未完成路线"])
@@ -1351,7 +1461,8 @@ def export_view(master, batch, batch_id, output):
         for field in ("stop_reason", "attempts", "elapsed_minutes"):
             if field in summary:
                 notes.append(["采集进度：" + field, str(summary[field])])
-    notes += [["资格规则版本", batch.get("rules_version", "1.0.0（历史批次未重新核验）")], ["目标客户类型", "、".join(profile.get("buyer_types", [])) or "历史批次未单列"], ["品牌准入", "目标产品白牌经营有据；混合经营须有白牌证据；品牌方／官方店／专卖店排除" if not legacy else "历史规则，未按新门槛复核"], ["优先级说明", "A/B仅为已通过准入候选的研究交接优先级，不是成交概率；无评级不等于低价值。旧批次保留历史资格，不自动晋级。"]]
+    policy_note = "独立商户须有目标产品及其他准入证据；白牌单独标记。品牌方排除；官方店／专卖店" + ("合格后另表收录" if profile.get("collect_brand_stores", False) else "本任务不收录") if independent_policy else "目标产品白牌经营有据；混合经营须有白牌证据；品牌方／官方店／专卖店排除" if not legacy else "历史规则，未按新门槛复核"
+    notes += [["资格规则版本", batch.get("rules_version", "1.0.0（历史批次未重新核验）")], ["目标客户类型", "、".join(profile.get("buyer_types", [])) or "历史批次未单列"], ["品牌准入", policy_note], ["优先级说明", "A/B仅为已通过准入候选的研究交接优先级，不是成交概率；无评级不等于低价值。旧批次保留历史资格，不自动晋级。"]]
     for name, value in profile.get("supplier_constraints", {}).items():
         notes.append(["供货条件：" + str(name), str(value)])
     for region in batch.get("region_research", []):
@@ -1365,8 +1476,11 @@ def export_view(master, batch, batch_id, output):
     if batch.get("schema_version", 1) >= 3:
         counts = batch["counts"]
         notes += [["增量统计", "新主体 %d；更新主体 %d；首次该范围合格 %d；同范围重新合格 %d；新增联系入口 %d；新增来源 %d" % tuple(counts.get(k, 0) for k in ("new_entities", "updated_entities", "first_qualified", "requalified", "new_contacts", "new_sources"))], ["资格范围", batch.get("scope_id", "")], ["活动新鲜度窗口", str(batch["task"].get("activity_max_age_days", 180)) + " 天；按实际活动日期核对，不按页面读取日"]]
-        if batch.get("view") != "current":
-            notes.append(["本主库新增合格客户", str(counts.get("new_qualified_entities", "历史未单列"))])
+        if not combined_view:
+            if independent_policy:
+                notes += [["本主库新增独立商户", str(counts.get("new_independent_qualified_entities", "未单列"))], ["本主库新增品牌店", str(counts.get("new_brand_store_entities", "未单列"))]]
+            else:
+                notes.append(["本主库新增合格客户", str(counts.get("new_qualified_entities", "历史未单列"))])
         else:
             notes = [row for row in notes if row[0] != "增量统计"]
         for cell in batch.get("coverage", []):
@@ -1377,8 +1491,12 @@ def export_view(master, batch, batch_id, output):
     context = batch["task"].get("project_context", {})
     if context.get("additional_sources"):
         notes.append(["跨库查重边界", "另有登记的历史或补充来源；本表新增数仅相对当前JSON主库，未自动证明企业净新增。须对照原件核主体，不能把安装或路径登记当作已完成查重。"])
-    write_xlsx(output, [("可开发客户", output_rows["main"], widths), ("待核线索", output_rows["candidate"], widths), ("来源证据", source_rows, [18, 24, 34, 62, 28, 24, 80, 50]), ("采集说明", notes, [24, 100])])
-    return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": batch["counts"], "sheets": 4}
+    sheets = [("可开发客户", output_rows["main"], widths)]
+    if independent_policy:
+        sheets.append(("品牌店", output_rows["brand_store"], widths))
+    sheets += [("待核线索", output_rows["candidate"], widths), ("来源证据", source_rows, [18, 24, 34, 62, 28, 24, 80, 50]), ("采集说明", notes, [24, 100])]
+    write_xlsx(output, sheets)
+    return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": batch["counts"], "sheets": len(sheets)}
 
 
 def main():

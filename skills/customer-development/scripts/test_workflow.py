@@ -123,13 +123,43 @@ class WorkflowTests(unittest.TestCase):
     def test_new_snapshot_defaults_to_coverage_not_automatic_twenty_customer_completion(self):
         result = flow.snapshot(self.root, "coverage-default")
         task = core.read_json(result["batch_path"])["task"]
-        self.assertEqual(task["collection_strategy"], "region_size_ladder")
+        self.assertEqual(task["collection_strategy"], "market_sequence")
         self.assertEqual(task["completion_policy"], "coverage")
         self.assertEqual(task["target_count"], 20)
         result = flow.snapshot(self.root, "explicit-count", {"target_count": 60})
         self.assertEqual(core.read_json(result["batch_path"])["task"]["completion_policy"], "target_or_coverage")
         result = flow.snapshot(self.root, "explicit-coverage", {"target_count": 60, "completion_policy": "coverage"})
         self.assertEqual(core.read_json(result["batch_path"])["task"]["completion_policy"], "coverage")
+        result = flow.snapshot(self.root, "explicit-old-strategy", {"collection_strategy": "region_size_ladder"})
+        self.assertEqual(core.read_json(result["batch_path"])["task"]["collection_strategy"], "region_size_ladder")
+
+    def test_policy_review_detects_new_brand_and_market_defaults_without_changing_old_task(self):
+        task = self.packet()["task"]
+        config = core.read_json(self.root / "config.json")
+        config.update(products=task["products"], supplementary_products=[], brand_policy="independent_product", collect_brand_stores=True, collection_strategy="market_sequence")
+        core.safe_write(self.root / "config.json", config)
+        before = copy.deepcopy(task)
+        report = flow._configuration_review(self.root, task)
+        self.assertFalse(report["product_scope_differs"])
+        self.assertTrue(report["policy_scope_differs"])
+        self.assertEqual(set(report["policy_differences"]), {"brand_policy", "collect_brand_stores", "collection_strategy"})
+        self.assertEqual(task, before)
+        result = flow.snapshot(self.root, "new-policies")
+        current = core.read_json(result["batch_path"])["task"]
+        self.assertEqual(current["customer_profile"]["brand_policy"], "independent_product")
+        self.assertTrue(current["customer_profile"]["collect_brand_stores"])
+        self.assertEqual(current["collection_strategy"], "market_sequence")
+
+    def test_prepare_coverage_uses_current_policy_and_keeps_brand_store_separate(self):
+        packet = self.packet()
+        packet["task"]["customer_profile"].update(brand_policy="independent_product", collect_brand_stores=True)
+        packet["leads"][0].update(brand_profile="independent", white_label_evidence=[])
+        result = flow._subset(packet, packet["leads"])
+        self.assertEqual(result["coverage"][0]["status"], "searched")
+        packet["leads"][0]["brand_profile"] = "official_store"
+        result = flow._subset(packet, packet["leads"])
+        self.assertEqual(result["coverage"][0]["status"], "searched_zero")
+        self.assertEqual(len(result["leads"]), 1)
 
     def test_enrich_defaults_to_provided_leads_without_rescanning_city(self):
         result = flow.snapshot(self.root, "enrich-known", {"mode": "enrich"})
@@ -157,6 +187,111 @@ class WorkflowTests(unittest.TestCase):
         packet = core.read_json(second["batch_path"])
         flow.checkpoint(self.root, packet)
         self.assertEqual(flow.status(self.root)["batch_id"], "second")
+
+    def test_pending_configuration_review_preserves_scope_budget_and_records(self):
+        core.commit(self.root, self.packet())
+        config = core.read_json(self.root / "config.json")
+        config.update(products=["智能眼镜", "蓝牙耳机"], supplementary_products=[])
+        core.safe_write(self.root / "config.json", config)
+        created = flow.snapshot(self.root, "pending-old-scope", {"countries": ["甲国"], "city": "甲城", "collection_strategy": "legacy"})
+        packet = core.read_json(created["batch_path"])
+        flow.checkpoint(self.root, packet)
+        research.register_channel(self.root, {"channel_id": "READINESS", "name": "离线测试", "kind": "website", "readiness": {"status": "untested", "checked_at": core.now(), "detail": "不联网"}})
+        research.plan_entry(self.root, packet["batch_id"], {"entry_id": "NEXT", "channel_id": "READINESS", "kind": "page", "url": "https://example.invalid/next", "products": ["智能眼镜"], "next_action": "未执行的测试入口"})
+        index_path = self.root / "execution/task-index.json"
+        index = core.read_json(index_path)
+        index["tasks"][packet["batch_id"]]["employee_marker"] = "保留索引扩展"
+        core.safe_write(index_path, index)
+        paths = [self.root / "execution/master.json", Path(created["batch_path"]), self.root / "research/pending-old-scope/research-log.json"]
+        before = {p: p.read_bytes() for p in paths}
+        index_before = index_path.read_bytes()
+        config.update(products=core.PRIMARY_PRODUCTS, supplementary_products=core.SUPPLEMENTARY_PRODUCTS)
+        core.safe_write(self.root / "config.json", config)
+        review = flow.status(self.root)["configuration_review"]
+        self.assertTrue(review["product_scope_differs"])
+        self.assertEqual(review["differences"]["products"]["only_in_task"], ["蓝牙耳机"])
+        self.assertIn("智能手表表带", review["differences"]["products"]["only_in_defaults"])
+        self.assertTrue(review["configuration_file_changed_since_task"])
+        self.assertEqual(index_before, index_path.read_bytes())
+        continued = flow.continue_task(self.root)
+        self.assertFalse(continued["created"])
+        self.assertTrue(continued["configuration_review"]["product_scope_differs"])
+        self.assertEqual(continued["packet"]["task"], packet["task"])
+        for p, contents in before.items():
+            self.assertEqual(p.read_bytes(), contents)
+        index_after = core.read_json(index_path)
+        self.assertEqual(index_after["active_batch_id"], packet["batch_id"])
+        self.assertEqual(index_after["tasks"][packet["batch_id"]]["employee_marker"], "保留索引扩展")
+
+    def test_committed_configuration_review_keeps_scope_and_new_snapshot_uses_defaults(self):
+        packet = self.packet()
+        core.commit(self.root, packet)
+        before = (self.root / "execution/master.json").read_bytes()
+        config = core.read_json(self.root / "config.json")
+        config.update(products=["智能手表", "智能手表表带"], supplementary_products=["蓝牙音响"])
+        core.safe_write(self.root / "config.json", config)
+        selected = flow.status(self.root)
+        self.assertTrue(selected["committed"])
+        self.assertEqual(selected["configuration_review"]["task_scope"]["products"], ["智能眼镜"])
+        continued = flow.continue_task(self.root, new_batch_id="same-scope")
+        self.assertEqual(continued["configuration_review"], selected["configuration_review"])
+        self.assertEqual(continued["packet"]["task"]["products"], ["智能眼镜"])
+        self.assertEqual(continued["packet"]["task"]["supplementary_products"], [])
+        self.assertEqual(core.scope_key(continued["packet"]["task"]), core.scope_key(packet["task"]))
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+        self.assertEqual(core.load_master(self.root)[0]["leads"]["TEST-001"]["manual_notes"], "人工初始记录")
+        fresh = flow.snapshot(self.root, "new-positioning")
+        fresh_task = core.read_json(fresh["batch_path"])["task"]
+        self.assertEqual(fresh_task["products"], config["products"])
+        self.assertEqual(fresh_task["supplementary_products"], config["supplementary_products"])
+        self.assertEqual(fresh_task["countries"], [])
+        self.assertNotIn("geo_scope", fresh_task)
+        self.assertNotIn("city", fresh_task)
+
+    def test_specialist_difference_is_not_reported_as_configuration_change(self):
+        info = flow.snapshot(self.root, "specialist", {"countries": ["甲国"], "products": ["蓝牙耳机"]})
+        review = flow.status(self.root)["configuration_review"]
+        self.assertTrue(review["product_scope_differs"])
+        self.assertFalse(review["configuration_file_changed_since_task"])
+        self.assertFalse(review["scope_changed_automatically"])
+        self.assertEqual(review["task_scope"]["supplementary_products"], [])
+        self.assertEqual(core.read_json(info["batch_path"])["task"]["products"], ["蓝牙耳机"])
+
+    def test_configuration_hash_and_version_differences_do_not_imply_product_change(self):
+        flow.snapshot(self.root, "same-products", {"countries": ["甲国"]})
+        config = core.read_json(self.root / "config.json")
+        config["products"] = list(reversed(config["products"]))
+        config["employee_note"] = "元数据变化，不改变业务范围"
+        core.safe_write(self.root / "config.json", config)
+        with mock.patch.object(core, "VERSION", "9.9.9"):
+            review = flow.status(self.root)["configuration_review"]
+        self.assertFalse(review["product_scope_differs"])
+        self.assertEqual(review["differences"], {})
+        self.assertTrue(review["configuration_file_changed_since_task"])
+        self.assertEqual(review["rules_versions"]["runtime"], "9.9.9")
+        self.assertEqual(review["rules_versions"]["binding"], core.VERSION)
+        self.assertEqual(review["versions_differ_from_runtime"]["task_runtime"], core.VERSION)
+
+    def test_legacy_supplementary_absence_and_effective_task_defaults(self):
+        config = core.read_json(self.root / "config.json")
+        config.pop("supplementary_products")
+        config["products"] = ["智能眼镜"]
+        core.safe_write(self.root / "config.json", config)
+        info = flow.snapshot(self.root, "legacy-supplementary")
+        packet = core.read_json(info["batch_path"])
+        packet["task"].pop("supplementary_products")
+        flow.checkpoint(self.root, packet)
+        review = flow.status(self.root)["configuration_review"]
+        self.assertFalse(review["product_scope_differs"])
+        self.assertEqual(review["current_defaults"]["supplementary_products"], [])
+        config.update(products=core.PRIMARY_PRODUCTS, supplementary_products=core.SUPPLEMENTARY_PRODUCTS,
+                      task_defaults={"products": ["蓝牙耳机"]})
+        core.safe_write(self.root / "config.json", config)
+        scoped = flow.snapshot(self.root, "default-specialist")
+        actual = core.read_json(scoped["batch_path"])["task"]
+        review = flow.status(self.root)["configuration_review"]
+        self.assertFalse(review["product_scope_differs"])
+        self.assertEqual(review["current_defaults"], {"products": actual["products"], "supplementary_products": actual["supplementary_products"]})
 
     def test_continue_committed_inherits_remaining_and_never_inserts_customers(self):
         packet = self.packet()
@@ -232,6 +367,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(path.read_text(encoding="utf-8").startswith(original))
         self.assertFalse(flow.setup_project(self.root, dedicated=True)["changed"])
         self.assertEqual(path.read_text(encoding="utf-8").count(flow.MANAGED_START), 1)
+
+    def test_setup_project_upgrades_market_sequence_instructions_without_rewriting_local_rules(self):
+        path = self.root / "AGENTS.md"
+        old = "\n".join(["# 本地保留规则", flow.MANAGED_START,
+                         "先完成当地渠道与联系生态预研，再按有据的大型、中型、小型路线逐层建立商户池。",
+                         flow.MANAGED_END, "# 附加规则\n本地限制保持不变。\n"])
+        path.write_text(old, encoding="utf-8")
+        result = flow.setup_project(self.root, dedicated=True)
+        updated = path.read_text(encoding="utf-8")
+        self.assertEqual(Path(result["backup_path"]).read_text(encoding="utf-8"), old)
+        self.assertTrue(updated.startswith("# 本地保留规则\n"))
+        self.assertTrue(updated.endswith("# 附加规则\n本地限制保持不变。\n"))
+        self.assertIn("国家→城市／地区→批发市场／批发城", updated)
+        self.assertIn("预算用尽继续当前市场", updated)
+        self.assertIn("每个市场独立交付 Excel", updated)
+        self.assertIn("历史任务保留其已冻结策略", updated)
+        self.assertNotIn("再按有据的大型、中型、小型路线逐层建立商户池", updated)
+        self.assertFalse(flow.setup_project(self.root, dedicated=True)["changed"])
 
     def test_checkpoint_saves_incomplete_draft_without_master_mutation(self):
         info = flow.snapshot(self.root, "draft")

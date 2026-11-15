@@ -51,6 +51,158 @@ class ResearchTests(unittest.TestCase):
     def log(self, bid="round-1"):
         return kit.read_json(self.root / "research" / bid / "research-log.json")
 
+    def deviation(self, did="deviation-1"):
+        path = self.root / (did + ".json")
+        path.write_text('{"synthetic_tool_result":"' + did + '"}')
+        stamp = kit.now()
+        return {"deviation_id": did, "kind": "unplanned_network", "started_at": stamp, "ended_at": stamp,
+                "detail": "Synthetic call occurred after a rejected plan; never a compliant registered attempt",
+                "evidence": {"path": path.name, "sha256": kit.digest_bytes(path.read_bytes())}}
+
+    def test_deviation_consumes_budget_without_discovery_or_master_mutation(self):
+        packet = self.packet(work_budget={"max_attempts": 2, "max_minutes": 45})
+        self.entry(packet)
+        master = (self.root / "execution/master.json").read_bytes()
+        deviation = self.deviation()
+        research.record_deviation(self.root, packet["batch_id"], deviation)
+        self.assertTrue(research.record_deviation(self.root, packet["batch_id"], deviation)["already_recorded"])
+        self.assertEqual(len(self.log()["attempts"]), 0)
+        self.assertEqual(research.status(self.root, packet["batch_id"])["research_effort"]["overall"]["unique_discovered"], 0)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet))
+        report = research.status(self.root, packet["batch_id"])
+        self.assertEqual((report["attempts"], report["ledger_attempts"], report["unplanned_attempts"]), (2, 1, 1))
+        self.assertIs(report["protocol_conformant"], False)
+        self.assertEqual(report["stop_reason"], "attempt_budget")
+        with self.assertRaisesRegex(kit.LeadkitError, "budget exhausted"):
+            self.entry(packet, eid="later")
+        with self.assertRaisesRegex(kit.LeadkitError, "budget exhausted"):
+            research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="attempt-2", retry_condition="new actual condition"))
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "One unplanned actual call is explicitly disclosed")
+        self.assertEqual(master, (self.root / "execution/master.json").read_bytes())
+
+    def test_deviation_evidence_and_times_are_guarded_and_immutable(self):
+        packet = self.packet()
+        self.entry(packet)
+        deviation = self.deviation()
+        for changed in [dict(deviation, ended_at="2099-01-01T00:00:00+00:00"),
+                        dict(deviation, started_at="2000-01-01T00:00:00+00:00"),
+                        dict(deviation, discovered_lead_ids=["TEST-001"]),
+                        dict(deviation, evidence={"path": "../outside.json", "sha256": "bad"}),
+                        dict(deviation, evidence={"path": deviation["evidence"]["path"], "sha256": "bad"})]:
+            with self.assertRaises(kit.LeadkitError):
+                research.record_deviation(self.root, packet["batch_id"], changed)
+        link = self.root / "link.json"
+        link.symlink_to(self.root / deviation["evidence"]["path"])
+        with self.assertRaisesRegex(kit.LeadkitError, "symlinks"):
+            research.record_deviation(self.root, packet["batch_id"], dict(deviation, evidence=dict(deviation["evidence"], path="link.json")))
+        research.record_deviation(self.root, packet["batch_id"], deviation)
+        with self.assertRaisesRegex(kit.LeadkitError, "immutable"):
+            research.record_deviation(self.root, packet["batch_id"], dict(deviation, detail="rewritten"))
+        with self.assertRaisesRegex(kit.LeadkitError, "already recorded"):
+            research.record_deviation(self.root, packet["batch_id"], dict(deviation, deviation_id="duplicate"))
+
+    def test_distinct_deviations_with_identical_response_bodies_both_consume_budget(self):
+        packet = self.packet(work_budget={"max_attempts": 2, "max_minutes": 45})
+        self.entry(packet)
+        first = self.deviation()
+        research.record_deviation(self.root, packet["batch_id"], first)
+        path = self.root / "second-call.json"
+        path.write_bytes((self.root / first["evidence"]["path"]).read_bytes())
+        stamp = kit.now()
+        second = dict(first, deviation_id="different-call", started_at=stamp, ended_at=stamp,
+                      evidence=dict(first["evidence"], path=path.name))
+        research.record_deviation(self.root, packet["batch_id"], second)
+        report = research.status(self.root, packet["batch_id"])
+        self.assertEqual((report["attempts"], report["unplanned_attempts"], report["ledger_attempts"]), (2, 2, 0))
+        self.assertEqual(report["stop_reason"], "attempt_budget")
+        with self.assertRaisesRegex(kit.LeadkitError, "already recorded"):
+            research.record_deviation(self.root, packet["batch_id"], dict(second, deviation_id="renamed-replay"))
+
+    def test_deviation_cannot_be_replayed_as_a_later_registered_attempt(self):
+        packet = self.systematic(work_budget={"max_attempts": 2, "max_minutes": 45})
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet))
+        deviation = self.deviation()
+        research.record_deviation(self.root, packet["batch_id"], deviation)
+        self.route_entry(packet, "large", registered_at=deviation["started_at"])
+        registered = self.log()["entries"]["entry-large"]["registered_at"]
+        self.assertGreater(research._time(registered), research._time(deviation["ended_at"]))
+        replay = self.attempt(packet, eid="entry-large", started_at=deviation["started_at"], ended_at=deviation["ended_at"])
+        with self.assertRaisesRegex(kit.LeadkitError, "predates execution registration"):
+            research.record_attempt(self.root, packet["batch_id"], replay)
+        self.assertEqual(self.log()["attempts"], {})
+        self.assertEqual(research.status(self.root, packet["batch_id"])["attempts"], 1)
+        # A genuinely later, separately registered call can still be recorded.
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="later-call", eid="entry-large"))
+        self.assertEqual(research.status(self.root, packet["batch_id"])["attempts"], 2)
+
+    def test_deferred_activation_refreshes_registration_and_rejects_earlier_call(self):
+        packet = self.packet()
+        research.register_channel(self.root, self.channel())
+        entry = {"entry_id": "queued", "channel_id": "synthetic_directory", "kind": "page", "url": "https://example.invalid/queued", "products": ["智能眼镜"], "next_action": "仅保存待读入口"}
+        research.plan_entry(self.root, packet["batch_id"], entry, defer=True)
+        queued_registration = self.log()["entries"]["queued"]["registered_at"]
+        unplanned = self.attempt(packet, eid="queued")
+        enabled = research.plan_entry(self.root, packet["batch_id"], dict(entry, registered_at=queued_registration))
+        self.assertGreater(research._time(enabled["registered_at"]), research._time(unplanned["ended_at"]))
+        with self.assertRaisesRegex(kit.LeadkitError, "predates execution registration"):
+            research.record_attempt(self.root, packet["batch_id"], unplanned)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="queued"))
+
+    def test_legacy_registration_is_readable_but_new_attempt_requires_fresh_plan(self):
+        packet = self.packet()
+        entry = self.entry(packet)
+        attempt = self.attempt(packet)
+        research.record_attempt(self.root, packet["batch_id"], attempt)
+        log = self.log()
+        log["entries"][entry["entry_id"]].pop("registered_at")
+        kit.safe_write(self.root / "research/round-1/research-log.json", log)
+        before = (self.root / "research/round-1/research-log.json").read_bytes()
+        self.assertEqual(research.status(self.root, packet["batch_id"])["attempts"], 1)
+        self.assertTrue(research.record_attempt(self.root, packet["batch_id"], attempt)["already_recorded"])
+        self.assertEqual(before, (self.root / "research/round-1/research-log.json").read_bytes())
+        retry = self.attempt(packet, aid="retry", retry_condition="Synthetic new evidence is available")
+        with self.assertRaisesRegex(kit.LeadkitError, "fresh plan-entry"):
+            research.record_attempt(self.root, packet["batch_id"], retry)
+        ready = research.plan_entry(self.root, packet["batch_id"], dict(entry, retry_condition=retry["retry_condition"], registered_at=log["started_at"]))
+        self.assertIn("registered_at", ready)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="retry", retry_condition=retry["retry_condition"]))
+
+    def test_deviation_cannot_supply_qualified_merchant_trace(self):
+        packet = self.systematic(work_budget={"max_attempts": 1, "max_minutes": 45})
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet))
+        self.route_entry(packet, "large")
+        research.record_deviation(self.root, packet["batch_id"], self.deviation())
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic unplanned call only")
+        with self.assertRaisesRegex(kit.LeadkitError, "source-linked"):
+            fixtures.LeadkitTests.commit(self, packet)
+
+    def test_deviation_raw_evidence_change_blocks_commit(self):
+        packet = self.packet(work_budget={"max_attempts": 1, "max_minutes": 45})
+        self.entry(packet)
+        deviation = self.deviation()
+        research.record_deviation(self.root, packet["batch_id"], deviation)
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic audited stop")
+        master = (self.root / "execution/master.json").read_bytes()
+        (self.root / deviation["evidence"]["path"]).write_text("changed raw evidence")
+        with self.assertRaisesRegex(kit.LeadkitError, "hash mismatch"):
+            fixtures.LeadkitTests.commit(self, packet)
+        self.assertEqual(master, (self.root / "execution/master.json").read_bytes())
+
+    def test_deviation_history_carries_without_charging_new_round(self):
+        packet = self.packet(work_budget={"max_attempts": 1, "max_minutes": 45})
+        packet["leads"][0]["status"] = "candidate"
+        self.save(packet)
+        self.entry(packet)
+        original_registration = self.log()["entries"]["page-1"]["registered_at"]
+        research.record_deviation(self.root, packet["batch_id"], self.deviation())
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic deviation is retained")
+        fixtures.LeadkitTests.commit(self, packet)
+        self.packet(bid="round-2", sid="SRC-002")
+        research.carry_forward(self.root, "round-1", "round-2")
+        self.assertEqual(research.status(self.root, "round-2")["attempts"], 0)
+        self.assertEqual(self.log("round-2")["deviation_history"][0]["batch_id"], "round-1")
+        self.assertEqual(self.log("round-2")["entries"]["page-1"]["registered_at"], original_registration)
+
     def test_policy_defaults_and_invalid_limits(self):
         policy = research.validate_policy({})
         self.assertEqual((policy["target_count"], policy["target_metric"], policy["work_budget"]), (20, "new_qualified", {"max_attempts": 80, "max_minutes": 45}))
@@ -719,6 +871,74 @@ class ResearchTests(unittest.TestCase):
                     with self.assertRaisesRegex(kit.LeadkitError, "source-linked merchant_collection"):
                         research.summary_for_commit(self.root, packet, master)
 
+    def test_snippet_candidate_can_qualify_via_subject_without_false_rediscovery(self):
+        # Mirrors the real integration failure: initial search discovers a
+        # candidate; a later strong read names subject_ids, not a new discovery.
+        packet = self.systematic(work_budget={"max_attempts": 2, "max_minutes": 45})
+        complete_lead = copy.deepcopy(packet["leads"][0])
+        snippet = dict(packet["sources"][0], source_id="DISCOVERY-SNIPPET", level="search_snippet")
+        packet["sources"].append(snippet)
+        discovered_by = [{"channel": "synthetic_directory", "source_ids": [snippet["source_id"]]}]
+        packet["leads"] = [{"lead_id": complete_lead["lead_id"], "name": complete_lead["name"], "country": complete_lead["country"],
+                            "status": "candidate", "reason": "Synthetic search discovery, facts still unverified", "discovered_by": discovered_by}]
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet, ("large",)))
+        self.route_entry(packet, "large", entry_id="initial-discovery", url="https://example.invalid/discovery", work_kind="discovery")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="discovery", eid="initial-discovery", source_ids=[snippet["source_id"]]))
+        complete_lead["discovered_by"] = discovered_by
+        packet["leads"] = [complete_lead]
+        self.save(packet)
+        self.route_entry(packet, "large", entry_id="qualify-subject", url="https://example.invalid/qualify", work_kind="qualification", subject_ids=[complete_lead["lead_id"]])
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="qualification", eid="qualify-subject", discovered_lead_ids=[]))
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic discovery and qualification are separate actual reads")
+        fixtures.LeadkitTests.commit(self, packet)
+        report = research.status(self.root, packet["batch_id"])
+        self.assertTrue(report["committed"])
+        self.assertEqual(report["counts"]["new_qualified"], 1)
+        self.assertEqual(report["research_effort"]["overall"]["unique_discovered"], 1)
+        self.assertEqual(report["research_effort"]["by_work_kind"]["qualification"]["unique_discovered"], 0)
+
+    def test_existing_candidate_subject_read_promotes_without_counting_new_discovery(self):
+        original = self.packet()
+        snippet = dict(original["sources"][0], source_id="OLD-DISCOVERY", level="search_snippet")
+        original["sources"].append(snippet)
+        original["leads"] = [{"lead_id": "TEST-001", "name": "虚构测试商户", "country": "测试国", "status": "candidate",
+                              "reason": "Earlier search only", "manual_notes": "保留人工备注", "discovered_by": [{"channel": "synthetic_directory", "source_ids": ["OLD-DISCOVERY"]}]}]
+        fixtures.LeadkitTests.commit(self, original)
+        packet = self.systematic(bid="promote-existing", sid="SRC-PROMOTION", work_budget={"max_attempts": 1, "max_minutes": 45})
+        packet["leads"][0]["discovered_by"] = copy.deepcopy(original["leads"][0]["discovered_by"])
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet, ("large",)))
+        self.route_entry(packet, "large", work_kind="contact", subject_ids=["TEST-001"])
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large", discovered_lead_ids=[]))
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic current original confirms the existing candidate")
+        fixtures.LeadkitTests.commit(self, packet)
+        report = research.status(self.root, packet["batch_id"])
+        self.assertEqual((report["counts"]["new_qualified"], report["counts"]["new_scope_qualified"]), (0, 1))
+        effort = report["research_effort"]
+        self.assertEqual(effort["overall"]["unique_discovered"], 0)
+        self.assertEqual(effort["by_subject"]["TEST-001"]["read"], 1)
+        self.assertEqual(effort["saved_records"]["entities_in_batch_without_read_attribution"], [])
+        self.assertEqual(effort["saved_records"]["entities_in_batch_without_discovery_attribution"], ["TEST-001"])
+        self.assertEqual(kit.load_master(self.root)[0]["leads"]["TEST-001"]["manual_notes"], "保留人工备注")
+
+    def test_subject_trace_still_requires_correct_merchant_and_its_strong_source(self):
+        for case in ("wrong_subject", "unrelated_source", "snippet_only"):
+            with self.subTest(case=case):
+                packet = self.systematic(bid="subject-" + case.replace("_", "-"), work_budget={"max_attempts": 1, "max_minutes": 45})
+                packet["leads"].append({"lead_id": "OTHER", "name": "Other synthetic candidate", "country": "测试国", "status": "candidate", "reason": "Different entity", "discovered_by": [{"channel": "synthetic_directory", "source_ids": ["SRC-001"]}]})
+                snippet = dict(packet["sources"][0], source_id="SUBJECT-SNIPPET", level="search_snippet")
+                packet["sources"].append(snippet)
+                packet["leads"][0]["discovered_by"] = [{"channel": "synthetic_directory", "source_ids": [snippet["source_id"]]}]
+                self.save(packet)
+                research.collection_plan(self.root, packet["batch_id"], self.plan(packet, ("large",)))
+                self.route_entry(packet, "large", work_kind="qualification", subject_ids=["OTHER" if case == "wrong_subject" else "TEST-001"])
+                source = "REG-SRC-001" if case == "unrelated_source" else snippet["source_id"] if case == "snippet_only" else "SRC-001"
+                research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large", source_ids=[source], discovered_lead_ids=[]))
+                research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic failed attribution test")
+                with self.assertRaisesRegex(kit.LeadkitError, "source-linked merchant_collection"):
+                    research.summary_for_commit(self.root, packet, kit.load_master(self.root)[0])
+
     def test_plan_cannot_delete_or_relabel_large_route_without_new_evidence(self):
         packet = self.systematic()
         plan = self.plan(packet)
@@ -807,6 +1027,336 @@ class ResearchTests(unittest.TestCase):
         self.save(second)
         with self.assertRaisesRegex(kit.LeadkitError, "same task scope"):
             research.carry_forward(self.root, packet["batch_id"], second["batch_id"])
+
+    def test_work_metadata_validates_subjects_without_reclassifying_legacy_entries(self):
+        packet = self.packet()
+        entry = self.entry(packet)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet))
+        before = (self.root / "research/round-1/research-log.json").read_bytes()
+        summary = research.status(self.root, packet["batch_id"])
+        self.assertEqual(summary["research_effort"]["by_work_kind"]["unclassified"]["attempts"], 1)
+        self.assertNotIn("work_kind", self.log()["entries"]["page-1"])
+        self.assertEqual(before, (self.root / "research/round-1/research-log.json").read_bytes())
+        next_entry = dict(entry, entry_id="page-2", url="https://example.invalid/page-2")
+        for changes in ({"work_kind": "enrichment"}, {"work_kind": []}, {"subject_ids": ["MISSING"]}, {"subject_ids": ["TEST-001", "TEST-001"]}, {"subject_ids": "TEST-001"}):
+            with self.subTest(changes=changes), self.assertRaises(kit.LeadkitError):
+                research.plan_entry(self.root, packet["batch_id"], dict(next_entry, **changes))
+        research.plan_entry(self.root, packet["batch_id"], dict(next_entry, work_kind="qualification", subject_ids=["TEST-001"]))
+        packet["leads"] = []
+        self.save(packet)
+        with self.assertRaisesRegex(kit.LeadkitError, "subject_ids references missing"):
+            research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="missing-subject", eid="page-2", discovered_lead_ids=[]))
+
+    def test_effort_deduplicates_entities_and_separates_discovery_from_saved_records(self):
+        fixtures.LeadkitTests.commit(self, self.packet())
+        packet = self.systematic(bid="round-2", sid="SRC-002")
+        fresh = dict(copy.deepcopy(packet["leads"][0]), lead_id="TEST-NEW", name="Synthetic new entity")
+        alias = dict(copy.deepcopy(fresh), lead_id="TEST-ALIAS", canonical_id="TEST-NEW", status="candidate")
+        untouched = dict(copy.deepcopy(fresh), lead_id="TEST-UNREAD", status="candidate")
+        packet["leads"].extend([fresh, alias, untouched])
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet, ("large", "medium")))
+        for eid, kind, subjects, state, found in (
+            ("discover", "discovery", [], "read", ["TEST-001", "TEST-NEW", "TEST-ALIAS"]),
+            ("qualify", "qualification", ["TEST-NEW", "TEST-ALIAS"], "read", ["TEST-NEW"]),
+            ("contact", "contact", ["TEST-001"], "failed", []),
+        ):
+            self.route_entry(packet, "large", entry_id=eid, url="https://example.invalid/" + eid, work_kind=kind, subject_ids=subjects)
+            research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="a-" + eid, eid=eid, state=state, discovered_lead_ids=found))
+        self.route_entry(packet, "preflight", purpose="channel_research")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="a-preflight", eid="entry-preflight", state="empty", discovered_lead_ids=[]))
+        summary = research.status(self.root, packet["batch_id"])
+        effort, review = summary["research_effort"], summary["allocation_review"]
+        self.assertEqual((effort["overall"]["attempts"], effort["overall"]["read"], effort["overall"]["empty"], effort["overall"]["failed_access"]), (4, 2, 1, 1))
+        self.assertEqual((effort["overall"]["unique_discovered"], effort["overall"]["new_discovered"], effort["overall"]["existing_discovered"], effort["overall"]["new_qualified_discovered"]), (2, 1, 1, 1))
+        self.assertEqual(effort["saved_records"]["unique_entities_in_batch"], 3)
+        self.assertEqual(effort["saved_records"]["entities_in_batch_without_read_attribution"], ["TEST-UNREAD"])
+        self.assertEqual(effort["by_subject"]["TEST-NEW"]["attempts"], 1)
+        self.assertNotIn("TEST-ALIAS", effort["by_subject"])
+        self.assertEqual(effort["by_subject"]["TEST-001"]["failed_access"], 1)
+        self.assertEqual(effort["by_subject"]["TEST-001"]["unique_discovered"], 0)
+        self.assertEqual(review["largest_route"], {"route_id": "route-large", "attempts": 3, "share_of_all_attempts": 0.75})
+        self.assertEqual(review["routes_without_merchant_attempts_this_round"], ["route-medium"])
+        self.assertTrue(review["advisory_only"])
+        self.assertEqual(self.log("round-2")["collection_plan"]["routes"]["route-large"]["state"], "active")
+        prepared = copy.deepcopy(packet)
+        prepared["leads"] = [l for l in prepared["leads"] if l["lead_id"] not in {"TEST-NEW", "TEST-ALIAS"}]
+        narrowed = research.status(self.root, packet["batch_id"], prepared)["research_effort"]
+        self.assertEqual(narrowed["overall"]["unique_discovered"], 1)
+        self.assertEqual(narrowed["overall"]["new_qualified_discovered"], 0)
+        self.assertEqual(narrowed["unresolved_record_ids"], ["TEST-ALIAS", "TEST-NEW"])
+        self.assertNotIn("TEST-NEW", narrowed["by_subject"])
+
+    def test_failed_access_ids_do_not_count_as_channel_or_effort_discovery(self):
+        packet = self.packet()
+        master_before = (self.root / "execution/master.json").read_bytes()
+        # Older logs may associate a known merchant with a failed read. Keep
+        # that audit record, but do not turn it into successful discovery.
+        for state in ("failed", "blocked", "needs_auth"):
+            self.entry(packet, eid="page-" + state)
+            research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="a-" + state, eid="page-" + state, state=state, discovered_lead_ids=["TEST-001"]))
+        before = (self.root / "research/round-1/research-log.json").read_bytes()
+        summary = research.status(self.root, packet["batch_id"])
+        channel = summary["channels"]["synthetic_directory"]
+        self.assertEqual(channel["attempts"], 3)
+        self.assertEqual((channel["unique_discovered"], channel["qualified"], channel["new_qualified"]), (0, 0, 0))
+        self.assertEqual(summary["research_effort"]["overall"]["unique_discovered"], 0)
+        self.assertEqual(summary["research_effort"]["overall"]["failed_access"], 3)
+        self.assertEqual(before, (self.root / "research/round-1/research-log.json").read_bytes())
+        self.entry(packet, eid="page-readable")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="a-readable", eid="page-readable"))
+        summary = research.status(self.root, packet["batch_id"])
+        self.assertEqual(summary["channels"]["synthetic_directory"]["unique_discovered"], 1)
+        self.assertEqual(summary["research_effort"]["overall"]["unique_discovered"], 1)
+        self.assertEqual(master_before, (self.root / "execution/master.json").read_bytes())
+
+    def defer_update(self, aid="attempt-1", alternative="route-medium"):
+        return {"state": "deferred", "detail": "Synthetic directory remains unread beyond this page", "cursor": "observed-page=1", "attempt_ids": [aid], "next_trigger": "Review after expanding the alternative directory", "next_action": "Continue the observed next directory page", "alternative_route_id": alternative, "allocation_reason": "Current merchant has an unresolved ownership gap; the observed alternative has unread relevant merchants"}
+
+    def test_deferral_requires_observed_work_and_executable_alternative(self):
+        packet = self.systematic()
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet))
+        update = self.defer_update()
+        with self.assertRaisesRegex(kit.LeadkitError, "own actual attempts"):
+            research.route_progress(self.root, packet["batch_id"], "route-large", update)
+        self.route_entry(packet, "large", work_kind="discovery")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        for field in ("next_trigger", "next_action", "allocation_reason"):
+            invalid = dict(update)
+            del invalid[field]
+            with self.subTest(field=field), self.assertRaises(kit.LeadkitError):
+                research.route_progress(self.root, packet["batch_id"], "route-large", invalid)
+        for alternative in ("route-large", "MISSING"):
+            with self.subTest(alternative=alternative), self.assertRaisesRegex(kit.LeadkitError, "alternative_route_id"):
+                research.route_progress(self.root, packet["batch_id"], "route-large", dict(update, alternative_route_id=alternative))
+        with self.assertRaisesRegex(kit.LeadkitError, "remains behind"):
+            research.route_progress(self.root, packet["batch_id"], "route-large", dict(update, alternative_route_id="route-small"))
+        with self.assertRaisesRegex(kit.LeadkitError, "not exhausted"):
+            research.route_progress(self.root, packet["batch_id"], "route-large", dict(update, directory_exhausted=True))
+        report = research.route_progress(self.root, packet["batch_id"], "route-large", update)
+        self.assertEqual(report["next_route_id"], "route-medium")
+        self.assertEqual(report["scope_completion"], "partial")
+        self.assertIn("route-large", report["unfinished_routes"])
+        with self.assertRaisesRegex(kit.LeadkitError, "not executable"):
+            self.route_entry(packet, "large", entry_id="large-new", url="https://example.invalid/large-new")
+        self.route_entry(packet, "medium", work_kind="discovery")
+        research.route_progress(self.root, packet["batch_id"], "route-large", {"state": "active", "detail": "Alternative pass reviewed; resume the saved next page", "cursor": "observed-page=1", "attempt_ids": []})
+        saved = self.log()["collection_plan"]["routes"]["route-large"]
+        self.assertEqual(saved["state"], "active")
+        self.assertEqual(saved["progress_history"][0]["state"], "deferred")
+        with self.assertRaisesRegex(kit.LeadkitError, "larger routes first"):
+            research.plan_entry(self.root, packet["batch_id"], self.log()["entries"]["entry-medium"])
+
+    def test_deferred_route_is_carried_without_fake_attempts_or_completion(self):
+        packet = self.systematic(work_budget={"max_attempts": 1, "max_minutes": 45})
+        packet["leads"][0]["status"] = "candidate"
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet, ("large", "medium")))
+        self.route_entry(packet, "large", work_kind="qualification", subject_ids=["TEST-001"])
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        research.route_progress(self.root, packet["batch_id"], "route-large", self.defer_update())
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Synthetic checkpoint with allocation decision preserved")
+        fixtures.LeadkitTests.commit(self, packet)
+        self.systematic(bid="round-2", sid="SRC-002")
+        research.carry_forward(self.root, "round-1", "round-2")
+        summary = research.status(self.root, "round-2")
+        self.assertEqual(summary["attempts"], 0)
+        self.assertEqual(summary["scope_completion"], "partial")
+        self.assertEqual(summary["next_route_id"], "route-medium")
+        self.assertEqual(summary["allocation_review"]["deferred_route_ids"], ["route-large"])
+        carried = self.log("round-2")["collection_plan"]["routes"]["route-large"]
+        self.assertEqual(carried["state"], "deferred")
+        self.assertEqual(carried["progress"]["allocation_reason"], self.defer_update()["allocation_reason"])
+        self.assertEqual(summary["research_effort"]["overall"]["unique_discovered"], 0)
+
+    def test_deferred_readable_route_prevents_false_all_access_blocked_finish(self):
+        packet = self.systematic()
+        research.collection_plan(self.root, packet["batch_id"], self.plan(packet, ("large", "medium")))
+        self.route_entry(packet, "large")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        research.route_progress(self.root, packet["batch_id"], "route-large", self.defer_update())
+        self.route_entry(packet, "medium")
+        self.finish_route(packet, "medium", "blocked")
+        with self.assertRaisesRegex(kit.LeadkitError, "deferred routes"):
+            research.finish(self.root, packet["batch_id"], "access_blocked", "Only the alternative is blocked")
+        self.assertIsNone(self.log()["finish"])
+
+    def market_packet(self, **policy):
+        packet = self.packet(collection_strategy="market_sequence", completion_policy="coverage", **policy)
+        packet["leads"][0]["market_assignment"] = {"market_id": "market-a", "relation": "within", "detail": "Synthetic merchant directory places this merchant inside market A", "source_ids": [packet["sources"][0]["source_id"]]}
+        self.save(packet)
+        return packet
+
+    def market_plan(self, packet):
+        plan = self.plan(packet)
+        sid = packet["sources"][0]["source_id"]
+        plan["preflight_city_id"] = "city-a"
+        plan["market_directory"] = {
+            "countries": [{"country_id": "country-test", "name": "测试国", "order": 1}],
+            "cities": [{"city_id": "city-a", "country_id": "country-test", "name": "测试城", "order": 1, "source_ids": [sid]},
+                       {"city_id": "city-b", "country_id": "country-test", "name": "乙城", "order": 2, "source_ids": [sid]}],
+            "markets": [{"market_id": mid, "city_id": city, "name": name, "order": order, "priority_basis": "Synthetic source-supported market priority", "source_ids": [sid], "size_source_ids": [sid], "boundary": "Observed synthetic directory and its actual links"}
+                        for mid, city, name, order in (("market-a", "city-a", "甲批发城", 1), ("market-b", "city-a", "乙批发城", 2), ("market-c", "city-b", "丙批发城", 1))],
+            "coverage": {"status": "partial", "detail": "Only these observed cities and markets; national completeness not established", "source_ids": []}}
+        for route, mid in zip(plan["routes"], ("market-a", "market-b", "market-c")):
+            route["market_id"] = mid
+        return plan
+
+    def complete_market(self, packet, size="large", mid="market-a"):
+        self.route_entry(packet, size, work_kind="discovery")
+        self.finish_route(packet, size, "read")
+        return research.market_progress(self.root, packet["batch_id"], mid, {
+            "state": "complete", "detail": "Synthetic observed directory boundary has been read", "boundary": "Observed page 1 and its disclosed merchant links only", "cursor": "page=1,end", "attempt_ids": ["attempt-" + size], "source_ids": [packet["sources"][0]["source_id"]], "directory_exhausted": True})
+
+    def test_market_sequence_restricts_merchants_but_allows_cross_market_reconnaissance(self):
+        packet = self.market_packet()
+        report = research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        active = report["market_sequence"]["active_market"]
+        self.assertEqual((active["country"], active["city"], active["market"]), ("测试国", "测试城", "甲批发城"))
+        self.assertEqual(report["market_sequence"]["active_market_id"], "market-a")
+        self.assertIsNone(report["market_sequence"]["next_market_id"])
+        with self.assertRaisesRegex(kit.LeadkitError, "restricted to the active market"):
+            self.route_entry(packet, "medium")
+        self.route_entry(packet, "medium", entry_id="recon-other-market", purpose="route_reconnaissance")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="recon", eid="recon-other-market", discovered_lead_ids=[]))
+        self.assertEqual(research.status(self.root, packet["batch_id"])["market_sequence"]["active_market_id"], "market-a")
+        self.route_entry(packet, "large")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        with self.assertRaisesRegex(kit.LeadkitError, "never jump to another market"):
+            research.route_progress(self.root, packet["batch_id"], "route-large", self.defer_update())
+
+    def test_market_completion_rejects_unread_routes_and_entries(self):
+        packet = self.market_packet()
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        update = {"state": "complete", "detail": "Attempted synthetic close", "boundary": "Observed page 1", "cursor": "page=1", "attempt_ids": [], "source_ids": ["SRC-001"], "directory_exhausted": True}
+        with self.assertRaisesRegex(kit.LeadkitError, "uncompleted"):
+            research.market_progress(self.root, packet["batch_id"], "market-a", update)
+        self.route_entry(packet, "large")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        pending = {"entry_id": "unread-card", "channel_id": "synthetic_directory", "kind": "page", "url": "https://example.invalid/observed-next", "products": ["智能眼镜"], "route_id": "route-large", "next_action": "Read actual remaining card"}
+        research.plan_entry(self.root, packet["batch_id"], pending, defer=True)
+        with self.assertRaisesRegex(kit.LeadkitError, "unread or blocked"):
+            research.route_progress(self.root, packet["batch_id"], "route-large", {"state": "complete", "detail": "Cannot hide pending card", "cursor": "page=1", "attempt_ids": ["attempt-1"], "directory_exhausted": True})
+        with self.assertRaisesRegex(kit.LeadkitError, "evidenced market-progress"):
+            research.finish(self.root, packet["batch_id"], "market_complete", "Cannot close before the market boundary")
+
+    def test_completed_market_waits_for_new_batch_and_new_city_requires_preflight(self):
+        packet = self.market_packet()
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        report = self.complete_market(packet)
+        self.assertEqual(report["market_sequence"]["next_market_id"], "market-b")
+        expanded = self.market_plan(packet)
+        expanded["routes"].append(dict(expanded["routes"][0], route_id="late-unread", entrypoint="https://example.invalid/late-unread"))
+        with self.assertRaisesRegex(kit.LeadkitError, "completed market boundary"):
+            research.collection_plan(self.root, packet["batch_id"], expanded)
+        with self.assertRaisesRegex(kit.LeadkitError, "market is complete"):
+            self.route_entry(packet, "medium")
+        research.finish(self.root, packet["batch_id"], "market_complete", "First market observed boundary complete")
+        fixtures.LeadkitTests.commit(self, packet)
+        second = self.market_packet(bid="round-2", sid="SRC-002")
+        second["leads"][0]["market_assignment"]["market_id"] = "market-b"
+        self.save(second)
+        research.carry_forward(self.root, "round-1", "round-2")
+        next_report = research.status(self.root, "round-2")
+        self.assertEqual(next_report["market_sequence"]["active_market_id"], "market-b")
+        self.assertTrue(next_report["preflight_ready"])
+        self.complete_market(second, "medium", "market-b")
+        research.finish(self.root, "round-2", "market_complete", "Second market observed boundary complete")
+        fixtures.LeadkitTests.commit(self, second)
+        third = self.market_packet(bid="round-3", sid="SRC-003")
+        research.carry_forward(self.root, "round-2", "round-3")
+        third_report = research.status(self.root, "round-3")
+        self.assertEqual(third_report["market_sequence"]["active_market_id"], "market-c")
+        self.assertFalse(third_report["city_preflight_ready"])
+        self.assertFalse(third_report["preflight_ready"])
+        with self.assertRaisesRegex(kit.LeadkitError, "preflight"):
+            self.route_entry(third, "small")
+        self.assertEqual(third_report["attempts"], 0)
+
+    def test_budget_continue_keeps_same_market_and_workflow_returns_market_context(self):
+        import leadkit_workflow as flow
+        packet = self.market_packet(work_budget={"max_attempts": 1, "max_minutes": 45})
+        packet["leads"][0]["status"] = "candidate"
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        self.route_entry(packet, "large", work_kind="qualification", subject_ids=["TEST-001"])
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Market still has unread entries")
+        fixtures.LeadkitTests.commit(self, packet)
+        result = flow.continue_task(self.root, packet["batch_id"], "next-market-round")
+        report = research.status(self.root, "next-market-round")
+        self.assertEqual(report["market_sequence"]["active_market_id"], "market-a")
+        self.assertFalse(report["market_sequence"]["active_market_complete"])
+        self.assertEqual(report["policy"]["work_budget"], {"max_attempts": 1, "max_minutes": 45})
+        self.assertEqual(report["attempts"], 0)
+        self.assertEqual(result["carried_research"]["market_sequence"]["active_market_id"], "market-a")
+
+    def test_market_deferral_can_change_internal_route_but_cannot_complete_market(self):
+        packet = self.market_packet()
+        plan = self.market_plan(packet)
+        plan["routes"].append(dict(plan["routes"][0], route_id="route-inner", size="medium", order=4, entrypoint="https://example.invalid/inner-directory"))
+        research.collection_plan(self.root, packet["batch_id"], plan)
+        self.route_entry(packet, "large")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        report = research.route_progress(self.root, packet["batch_id"], "route-large", self.defer_update(alternative="route-inner"))
+        self.assertEqual(report["next_route_id"], "route-inner")
+        self.assertEqual(report["market_sequence"]["active_market_id"], "market-a")
+        self.route_entry(packet, "inner")
+        with self.assertRaisesRegex(kit.LeadkitError, "uncompleted"):
+            research.market_progress(self.root, packet["batch_id"], "market-a", {"state": "complete", "detail": "Cannot skip the deferred route", "boundary": "Synthetic page 1", "cursor": "page=1", "attempt_ids": ["attempt-1"], "source_ids": ["SRC-001"], "directory_exhausted": True})
+
+    def test_market_assignment_is_required_for_main_but_unknown_position_can_be_candidate(self):
+        packet = self.market_packet(work_budget={"max_attempts": 1, "max_minutes": 45})
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        self.route_entry(packet, "large")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        research.finish(self.root, packet["batch_id"], "attempt_budget", "Partial market stage")
+        master, _ = kit.load_master(self.root)
+        self.assertEqual(research.summary_for_commit(self.root, packet, master)["counts"]["qualified"], 1)
+        for change in (None, {"market_id": "market-b", "relation": "within", "detail": "Wrong market", "source_ids": ["SRC-001"]}, {"market_id": "market-a", "relation": "nearby", "detail": "Nearby is not within", "source_ids": ["SRC-001"]}, {"market_id": "market-a", "relation": "within", "detail": "No readable proof", "source_ids": []}):
+            invalid = copy.deepcopy(packet)
+            if change is None:
+                invalid["leads"][0].pop("market_assignment")
+            else:
+                invalid["leads"][0]["market_assignment"] = change
+            with self.subTest(change=change), self.assertRaises(kit.LeadkitError):
+                research.summary_for_commit(self.root, invalid, master)
+        candidate = copy.deepcopy(packet)
+        candidate["leads"][0].pop("market_assignment")
+        candidate["leads"][0]["status"] = "candidate"
+        self.assertEqual(research.summary_for_commit(self.root, candidate, master)["counts"]["qualified"], 0)
+
+    def test_market_directory_cannot_be_reordered_or_claim_unexplored_hierarchy_complete(self):
+        packet = self.market_packet()
+        plan = self.market_plan(packet)
+        research.collection_plan(self.root, packet["batch_id"], plan)
+        changed = copy.deepcopy(plan)
+        changed["market_directory"]["markets"][0]["order"] = 2
+        changed["market_directory"]["markets"][1]["order"] = 1
+        with self.assertRaisesRegex(kit.LeadkitError, "sequence are fixed"):
+            research.collection_plan(self.root, packet["batch_id"], changed)
+        changed = copy.deepcopy(plan)
+        changed["batch_market_id"] = "market-b"
+        with self.assertRaisesRegex(kit.LeadkitError, "fixed to one market"):
+            research.collection_plan(self.root, packet["batch_id"], changed)
+        changed = copy.deepcopy(plan)
+        changed["market_directory"]["cities"].append({"city_id": "city-unexplored", "country_id": "country-test", "name": "未研究城市", "order": 3, "source_ids": ["SRC-001"]})
+        changed["market_directory"]["coverage"] = {"status": "complete", "detail": "Cannot call this complete", "source_ids": ["SRC-001"]}
+        with self.assertRaisesRegex(kit.LeadkitError, "unexplored"):
+            research.collection_plan(self.root, packet["batch_id"], changed)
+
+    def test_brand_stores_are_reported_but_never_meet_independent_main_target(self):
+        packet = self.packet(target_count=1)
+        packet["task"]["customer_profile"].update(brand_policy="independent_product", collect_brand_stores=True)
+        packet["leads"][0]["brand_profile"] = "official_store"
+        self.save(packet)
+        self.entry(packet)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet))
+        report = research.status(self.root, packet["batch_id"])
+        self.assertFalse(report["target_reached"])
+        self.assertEqual(report["counts"]["brand_store_main"], 1)
+        self.assertEqual(report["counts"]["independent_main"], 0)
+        self.assertEqual(report["counts"]["new_qualified"], 0)
 
 
 if __name__ == "__main__":

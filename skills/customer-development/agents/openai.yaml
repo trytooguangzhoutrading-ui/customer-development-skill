@@ -1,6 +1,6 @@
 interface:
   display_name: "客户自动采集"
-  short_description: "输入地区产品，先查当地渠道与联系，再由大到小采集白牌客户并交付Excel"
-  default_prompt: "使用 $customer-development 沿用本项目规则和历史主库，先研究当地渠道与联系生态，按有据的大型到小型渠道采集，核白牌、主体与实际联系，去重后交付Excel。"
+  short_description: "按国家城市逐市场采集主营商户，白牌单独标记，品牌店分表并交付Excel"
+  default_prompt: "使用 $customer-development 沿用本项目规则和统一主库，按国家、城市、市场逐个采集主营商户，白牌只作标记，品牌店独立列示，每个市场交付Excel并更新进度总览。"
 policy:
   allow_implicit_invocation: true

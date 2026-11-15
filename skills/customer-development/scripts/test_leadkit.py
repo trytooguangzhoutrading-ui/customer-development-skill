@@ -25,6 +25,8 @@ class LeadkitTests(unittest.TestCase):
         result = kit.snapshot(self.root, bid)
         packet = kit.read_json(result["batch_path"])
         packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"], collection_strategy="legacy", completion_policy="target_or_coverage", business_priorities=[], preferred_buyer_types=[], supplementary_products=[])
+        # Existing regressions intentionally exercise the frozen historical policy.
+        packet["task"]["customer_profile"].update(brand_policy="white_label_required", collect_brand_stores=False)
         packet["sources"] = [{"source_id": sid, "url": "https://example.invalid/merchant", "title": "虚构测试原文", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "仅测试。虚构商户经营智能眼镜，测试国公开业务电话 +00123456789。"}]
         packet["leads"] = [{"lead_id": lid, "name": "虚构测试商户", "country": "测试国", "city": "测试城", "address": "仅测试地址", "status": "main", "identity_source_ids": [sid], "location_source_ids": [sid], "product_evidence": [{"product": "智能眼镜", "detail": "虚构测试型号", "source_ids": [sid]}], "contacts": [{"kind": "phone", "value": "+00123456789", "role": "商户公开业务电话", "attribution": "虚构商户原文同页", "source_ids": [sid]}], "reason": "仅用于离线测试", "unknowns": ["采购权限未核"], "manual_notes": "人工初始记录"}]
         packet["sources"].append({"source_id": "REG-" + sid, "url": "https://example.invalid/region", "title": "虚构地区研究", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "虚构测试国使用测试语言，有商户目录；全部虚构。"})
@@ -36,9 +38,232 @@ class LeadkitTests(unittest.TestCase):
     def commit(self, packet):
         packet["coverage"] = []
         for product in packet["task"]["products"]:
-            qualified = any(x["status"] == "main" and any(p["product"] == product for p in x.get("product_evidence", [])) and any(p["product"] == product for p in x.get("white_label_evidence", [])) for x in packet["leads"])
+            sources = dict(kit.load_master(self.root)[0]["sources"], **{s["source_id"]: s for s in packet["sources"]})
+            qualified = any(x["status"] == "main" and product in kit.matched_products(x, packet["task"], sources) for x in packet["leads"])
             packet["coverage"].append({"product": product, "channel": "synthetic_directory", "status": "searched" if qualified else "searched_zero", "attempts": 1, "source_ids": [packet["sources"][0]["source_id"]], "limitations": [], "discovered_lead_ids": [x["lead_id"] for x in packet["leads"]]})
         return kit.commit(self.root, packet)
+
+    def independent_packet(self, bid="new-policy", lid="TEST-001", sid="SRC-001"):
+        packet = self.packet(bid, lid, sid)
+        packet["task"]["customer_profile"].update(brand_policy="independent_product", collect_brand_stores=True)
+        packet["leads"][0].update(brand_profile="independent", white_label_evidence=[])
+        return packet
+
+    def test_independent_product_admission_derives_white_label_status(self):
+        packet = self.independent_packet()
+        packet["leads"][0].update(white_label_status="verified", white_label_products=["智能眼镜"], collection_segment="brand_store")
+        result = self.commit(packet)
+        saved = kit.load_master(self.root)[0]["batches"]["new-policy"]["lead_snapshots"][0]
+        self.assertEqual((result["counts"]["independent_main"], result["counts"]["brand_store_main"]), (1, 0))
+        self.assertEqual(result["counts"]["new_independent_qualified_entities"], 1)
+        self.assertEqual(saved["collection_segment"], "independent")
+        self.assertEqual(saved["white_label_status"], "unverified")
+        self.assertEqual(saved["white_label_products"], [])
+        self.assertEqual(saved["qualified_products"], ["智能眼镜"])
+        self.assertNotIn("白牌", saved["priority_reason"])
+
+    def test_new_policy_brand_stores_are_counted_and_exported_separately(self):
+        packet = self.independent_packet()
+        for index, brand in enumerate(("official_store", "brand_exclusive"), 2):
+            store = copy.deepcopy(packet["leads"][0])
+            store.update(lead_id="TEST-00" + str(index), name="虚构品牌店" + str(index), brand_profile=brand)
+            store["contacts"][0]["value"] = "+0012345678" + str(index)
+            packet["leads"].append(store)
+        counts = self.commit(packet)["counts"]
+        self.assertEqual((counts["main"], counts["independent_main"], counts["brand_store_main"]), (3, 1, 2))
+        self.assertEqual((counts["new_independent_qualified_entities"], counts["new_brand_store_entities"]), (1, 2))
+        output = self.root / "outputs/new-policy.xlsx"
+        self.assertEqual(kit.export_batch(self.root, "new-policy", output)["sheets"], 5)
+        with zipfile.ZipFile(output) as archive:
+            book = ET.fromstring(archive.read("xl/workbook.xml"))
+            self.assertEqual([x.attrib["name"] for x in book.find(kit.tag("sheets"))], ["可开发客户", "品牌店", "待核线索", "来源证据", "采集说明"])
+            main = archive.read("xl/worksheets/sheet1.xml").decode()
+            stores = archive.read("xl/worksheets/sheet2.xml").decode()
+            self.assertIn("TEST-001", main)
+            self.assertNotIn("TEST-002", main)
+            self.assertIn("TEST-002", stores)
+            self.assertIn("TEST-003", stores)
+            self.assertIn("白牌核实状态", main)
+            self.assertIn("待核", stores)
+
+    def test_new_policy_keeps_product_contact_and_identity_gates(self):
+        packet = self.independent_packet()
+        for field, replacement, error in (("product_evidence", [], "requested product"), ("contacts", [], "actionable"), ("identity_source_ids", [], "identity_source_ids")):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(packet)
+                changed["leads"][0][field] = replacement
+                with self.assertRaisesRegex(kit.LeadkitError, error):
+                    self.commit(changed)
+        for brand in ("unknown", "brand_owner"):
+            changed = copy.deepcopy(packet)
+            changed["leads"][0]["brand_profile"] = brand
+            with self.assertRaises(kit.LeadkitError):
+                self.commit(changed)
+        packet["task"]["customer_profile"]["collect_brand_stores"] = False
+        packet["leads"][0]["brand_profile"] = "official_store"
+        with self.assertRaisesRegex(kit.LeadkitError, "excluded"):
+            self.commit(packet)
+
+    def test_brand_policy_scope_isolation_keeps_exact_historical_key(self):
+        packet = self.packet()
+        task = packet["task"]
+        historical_dimensions = {"geo_scope": [{"country": kit.normalized("测试国")}], "products": sorted(task["products"]), "buyer_types": sorted(task["customer_profile"]["buyer_types"]), "requirements": [], "supplier_constraints": {}, "brand_policy": "white_label_required"}
+        old_key = "scope-" + kit.digest_bytes(kit.encoded(historical_dimensions))[:24]
+        self.assertEqual(kit.scope_key(task), old_key)
+        task["customer_profile"].pop("collect_brand_stores")
+        self.assertEqual(kit.scope_key(task), old_key)
+        task["customer_profile"].update(brand_policy="independent_product", collect_brand_stores=True)
+        new_key = kit.scope_key(task)
+        self.assertNotEqual(new_key, old_key)
+        task["customer_profile"]["collect_brand_stores"] = False
+        self.assertNotEqual(kit.scope_key(task), new_key)
+
+    def test_product_only_requalification_preserves_old_white_label_scope_and_export(self):
+        old = self.packet()
+        old["leads"][0].update(status="candidate", white_label_evidence=[])
+        self.commit(old)
+        original = copy.deepcopy(kit.load_master(self.root)[0]["batches"]["round-1"])
+        output = self.root / "outputs/historical.xlsx"
+        self.assertEqual(kit.export_batch(self.root, "round-1", output)["sheets"], 4)
+        original_file = output.read_bytes()
+        new = self.independent_packet(sid="SRC-002")
+        self.commit(new)
+        master = kit.load_master(self.root)[0]
+        self.assertEqual(master["batches"]["round-1"], original)
+        self.assertEqual(output.read_bytes(), original_file)
+        lead = master["leads"]["TEST-001"]
+        self.assertEqual(lead["qualifications"][kit.scope_key(old["task"])]["status"], "candidate")
+        self.assertEqual(lead["qualifications"][kit.scope_key(new["task"])]["status"], "main")
+        self.assertEqual(kit.current_scope_view(master, kit.scope_key(old["task"]))[0]["status"], "candidate")
+
+    def test_historical_brand_store_policy_exclusion_can_be_collected_without_fact_reversal(self):
+        old = self.packet()
+        old["leads"][0].update(status="excluded", brand_profile="official_store", exclusion={"code":"official_store", "origin":"evidence", "detail":"历史政策排除官方店", "source_ids":["SRC-001"]})
+        self.commit(old)
+        new = self.independent_packet(sid="SRC-002")
+        new["leads"][0]["brand_profile"] = "official_store"
+        self.commit(new)
+        master = kit.load_master(self.root)[0]
+        lead = master["leads"]["TEST-001"]
+        self.assertEqual(lead["qualifications"][kit.scope_key(old["task"])]["status"], "excluded")
+        current = kit.current_scope_view(master, kit.scope_key(new["task"]))[0]
+        self.assertEqual((current["status"], current["collection_segment"]), ("main", "brand_store"))
+        self.assertEqual(master["batches"]["round-1"]["lead_snapshots"][0]["status"], "excluded")
+
+    def test_new_policy_does_not_silently_reclassify_old_official_store_as_independent(self):
+        old = self.packet()
+        old["leads"][0].update(status="excluded", brand_profile="official_store", exclusion={"code":"official_store", "origin":"evidence", "detail":"官方关系事实", "source_ids":["SRC-001"]})
+        self.commit(old)
+        new = self.independent_packet(sid="SRC-002")
+        with self.assertRaisesRegex(kit.LeadkitError, "exclusion_resolution"):
+            self.commit(new)
+        new["leads"][0]["exclusion_resolution"] = {"detail":"新强原文纠正独立经营身份", "source_ids":["SRC-002"]}
+        self.commit(new)
+
+    def test_old_policy_store_exclusion_does_not_revoke_new_policy_store_qualification(self):
+        new = self.independent_packet()
+        new["leads"][0]["brand_profile"] = "official_store"
+        self.commit(new)
+        old = self.packet("legacy-check", sid="SRC-002")
+        old["leads"][0].update(status="excluded", brand_profile="official_store", exclusion={"code":"official_store", "origin":"evidence", "detail":"相同官方店事实，旧任务不收录", "source_ids":["SRC-002"]})
+        self.commit(old)
+        master = kit.load_master(self.root)[0]
+        self.assertEqual(master["leads"]["TEST-001"]["status"], "main")
+        self.assertEqual(kit.current_scope_view(master, kit.scope_key(new["task"]))[0]["status"], "main")
+        self.assertEqual(kit.current_scope_view(master, kit.scope_key(old["task"]))[0]["status"], "excluded")
+
+    def test_new_policy_brand_store_exclusion_uses_actual_nonbrand_reason(self):
+        packet = self.independent_packet()
+        lead = packet["leads"][0]
+        lead.update(status="excluded", brand_profile="official_store", exclusion={"code":"official_store", "origin":"evidence", "detail":"仅品牌店属性", "source_ids":["SRC-001"]})
+        with self.assertRaisesRegex(kit.LeadkitError, "collects brand stores"):
+            self.commit(packet)
+        lead["exclusion"].update(code="outside_scope", detail="实际经营地域不在任务范围")
+        self.assertEqual(self.commit(packet)["counts"]["excluded"], 1)
+
+    def test_collected_brand_store_cannot_become_independent_without_correction(self):
+        packet = self.independent_packet()
+        packet["leads"][0]["brand_profile"] = "official_store"
+        self.commit(packet)
+        second = self.independent_packet("independent-correction", sid="SRC-002")
+        with self.assertRaisesRegex(kit.LeadkitError, "exclusion_resolution"):
+            self.commit(second)
+        second["leads"][0]["exclusion_resolution"] = {"detail":"新原文纠正官方关系声明", "source_ids":["SRC-002"]}
+        self.assertEqual(self.commit(second)["counts"]["independent_main"], 1)
+
+    def test_white_label_conflict_is_reported_without_blocking_new_policy(self):
+        packet = self.independent_packet()
+        lead = packet["leads"][0]
+        lead["white_label_evidence"] = [{"product":"智能眼镜", "detail":"有白牌声明但存在未解冲突", "source_ids":["SRC-001"]}]
+        lead["issues"] = [self.issue(kind="white_label_conflict")]
+        self.commit(packet)
+        master = kit.load_master(self.root)[0]
+        current = kit.current_scope_view(master, kit.scope_key(packet["task"]))[0]
+        self.assertEqual(current["status"], "main")
+        self.assertEqual(current["white_label_status"], "unverified")
+        self.assertFalse(kit.issue_blocks(lead["issues"][0], packet["task"]))
+        legacy = copy.deepcopy(packet["task"])
+        legacy["customer_profile"].update(brand_policy="white_label_required", collect_brand_stores=False)
+        self.assertTrue(kit.issue_blocks(lead["issues"][0], legacy))
+        self.assertTrue(kit.issue_blocks(self.issue(kind="identity_conflict"), packet["task"]))
+
+    def test_market_delivery_notes_and_assignment_sources_do_not_claim_new_customers(self):
+        packet = self.independent_packet()
+        market_source = dict(packet["sources"][0], source_id="SRC-MARKET", url="https://example.invalid/location", title="独立市场归属来源")
+        packet["sources"].append(market_source)
+        packet["leads"][0]["market_assignment"] = {"market_id":"MARKET-1", "relation":"within", "detail":"有据位于指定市场", "source_ids":["SRC-MARKET"]}
+        self.commit(packet)
+        master = kit.load_master(self.root)[0]
+        batch = copy.deepcopy(master["batches"]["new-policy"])
+        batch.update(view="market_delivery", source_ids=[])
+        context = {"country":"测试国", "city":"测试城", "market":"测试批发市场", "market_id":"MARKET-1", "state":"blocked", "boundary":"只核登记的一层店铺"}
+        batch["research_summary"] = {"counts":{"new_qualified":999}, "target_observed":999, "market_sequence":{"active_market":context}}
+        output = self.root / "outputs/market.xlsx"
+        kit.export_view(master, batch, "new-policy", output)
+        with zipfile.ZipFile(output) as archive:
+            sources = archive.read("xl/worksheets/sheet4.xml").decode()
+            notes = archive.read("xl/worksheets/sheet5.xml").decode()
+            self.assertIn("独立市场归属来源", sources)
+            self.assertIn("测试批发市场", notes)
+            self.assertIn("受阻未完成", notes)
+            self.assertIn("只核登记的一层店铺", notes)
+            self.assertIn("截至参考批次的市场合并交付", notes)
+            self.assertNotIn("增量统计", notes)
+            self.assertNotIn("本主库新增合格", notes)
+            self.assertNotIn("999", notes)
+
+    def test_saved_white_label_state_includes_unresolved_historical_queue_conflict(self):
+        old = self.packet()
+        old["leads"][0]["status"] = "candidate"
+        old["queue"] = [self.issue(kind="white_label_conflict", lead_id="TEST-001")]
+        self.commit(old)
+        new = self.independent_packet(sid="SRC-002")
+        new["leads"][0]["white_label_evidence"] = [{"product":"智能眼镜", "detail":"本轮白牌声明，先前冲突尚未解决", "source_ids":["SRC-002"]}]
+        self.commit(new)
+        master = kit.load_master(self.root)[0]
+        snapshot = master["batches"]["new-policy"]["lead_snapshots"][0]
+        self.assertEqual(snapshot["white_label_status"], "unverified")
+        self.assertEqual(snapshot["white_label_products"], [])
+        output = self.root / "outputs/white-review.xlsx"
+        kit.export_batch(self.root, "new-policy", output)
+        with zipfile.ZipFile(output) as archive:
+            row = ET.fromstring(archive.read("xl/worksheets/sheet1.xml")).find(kit.tag("sheetData"))[1]
+            self.assertEqual(row[22].find(".//" + kit.tag("t")).text, "待核")
+
+    def test_brand_identity_change_cannot_leave_another_scope_in_independent_main(self):
+        original = self.independent_packet()
+        self.commit(original)
+        second = self.independent_packet("official-watch", sid="SRC-002")
+        second["task"]["products"] = ["智能手表"]
+        second["leads"][0]["brand_profile"] = "official_store"
+        second["leads"][0]["product_evidence"][0]["product"] = "智能手表"
+        self.commit(second)
+        master = kit.load_master(self.root)[0]
+        self.assertEqual(master["batches"]["new-policy"]["lead_snapshots"][0]["status"], "main")
+        prior = kit.current_scope_view(master, kit.scope_key(original["task"]))[0]
+        self.assertEqual(prior["status"], "candidate")
+        current = kit.current_scope_view(master, kit.scope_key(second["task"]))[0]
+        self.assertEqual((current["status"], current["collection_segment"]), ("main", "brand_store"))
 
     def test_init_no_overwrite(self):
         original = (self.root / "execution/master.json").read_bytes()

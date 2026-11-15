@@ -1,4 +1,4 @@
-# 本地运行与数据契约 · 1.3
+# 本地运行与数据契约 · 1.5
 
 脚本只校验和保存已研究的记录，不联网、不证明来源真实。Codex须实际阅读证据并判断归属。Python 3.9+标准库即可。优先用snapshot生成结构，参照[虚构示例](../assets/batch-example.json)，不要猜字段。全部JSON用UTF-8；员工不负责填写JSON。
 
@@ -32,7 +32,7 @@ batch_id为1–80位ASCII字母/数字/下划线/短横线，以字母或数字�
 | products | 七类支持产品中的非空子集；新项目默认智能眼镜、智能手表、智能手表表带、智能手环、智能戒指；音箱先规范为蓝牙音响 |
 | supplementary_products | 主线外同渠道附带产品数组，默认蓝牙耳机、蓝牙音响；不与products重叠，不参与本轮main准入或合格目标。显式覆盖products时默认清空，除非同时明确提供附带范围；该字段不扩展任务资格范围、entry.products或必需coverage |
 | requirements | 必须满足的条件字符串数组；不把优先偏好混入 |
-| customer_profile | `{buyer_types:[...],brand_policy:"white_label_required",supplier_constraints:{...}}`；未知供货条件不填为事实 |
+| customer_profile | `{buyer_types:[...],brand_policy:"independent_product",collect_brand_stores:true,supplier_constraints:{...}}`为新默认；未知供货条件不填事实。旧white_label_required保留原政策，不能同时开启品牌店采集 |
 | geo_scope | 范围对象数组，每项`country`及可选`city`、`market`、`address`；省略时从countries与旧city/market/address规范化 |
 | activity_max_age_days | 活动证据评估窗口，默认180，允许1–730；只影响A评级，不直接淘汰B |
 | allow_channel_candidates | 布尔值，默认false；允许相邻渠道候选，不豁免main门槛 |
@@ -41,7 +41,7 @@ mode为new/continue/enrich；target_count为正整数，默认20；target_metric
 
 business_priorities为按先后排列的可选枚举：supplier_fit、product_coverage、buyer_type、procurement_access；preferred_buyer_types保存本轮偏好的画像类型。偏好不改变准入，也不混入requirements。新项目默认business_priorities=[buyer_type]，优先批发商、进口商、分销商、当地市场商户，并限制在本轮允许画像内；有显式偏好时按其可证指标排序，再按A/B，并列稳定。显式清空偏好后按A/B优先，旧配置不强制改写。
 
-task.collection_strategy为region_size_ladder（新发现默认）、provided_leads（指定名单补证）或legacy（旧任务兼容）。task.completion_policy为coverage或target_or_coverage，未指定数量的新发现默认coverage，20只作阶段观察目标；显式数量可采用target_or_coverage。新系统采集必须保存渠道地图、实际联系生态和执行账本，不能删策略字段模拟旧任务绕过。字段与命令见[research-progress.md](research-progress.md)。
+task.collection_strategy新默认为market_sequence（按国家、城市和市场顺序采集）；provided_leads用于指定名单补证；region_size_ladder和legacy保留旧任务兼容。task.completion_policy为coverage或target_or_coverage，未指定数量的新发现默认coverage，20只作阶段观察目标；显式数量可采用target_or_coverage。新系统采集必须保存渠道地图、实际联系生态和执行账本，不能删策略字段模拟旧任务绕过。字段与命令见[research-progress.md](research-progress.md)。
 
 ## 地区预研与来源
 
@@ -66,7 +66,7 @@ sources每项必填`source_id,url,title,read_at,level,excerpt`；url为不含凭
 
 ## 客户及准入
 
-每条lead必填`lead_id,name,country,status,reason,discovered_by`（发现渠道的精确结构见下文覆盖部分），status是**本次任务资格**：main/candidate/excluded，不是全局经营状态。可填city、market、address、market_location、aliases和人工初始备注；研究更新保留原manual_notes/manual_owner/sales_stage。
+每条lead必填`lead_id,name,country,status,reason,discovered_by`（发现渠道的精确结构见下文覆盖部分），status是**本次任务资格**：main/candidate/excluded，不是全局经营状态。新政策下main包含独立商户及满足条件的品牌店；collection_segment由运行层推导为independent／brand_store，分别交付和计数，不能手填分组绕过身份核验。可填city、market、address、market_location、aliases和人工初始备注；研究更新保留原manual_notes/manual_owner/sales_stage。
 
 main需要以下所有条件；不能用分数抵消缺项：
 
@@ -76,8 +76,8 @@ main需要以下所有条件；不能用分数抵消缺项：
 | location_source_ids | 实际经营地域依据，送货范围不等于地址 |
 | buyer_type / buyer_type_source_ids | 类型属于本轮画像，且有可读证据 |
 | product_evidence | `[{product,detail,source_ids}]`，至少一种本轮目标产品有可读依据 |
-| brand_profile | white_label或mixed；三类品牌排除也须有证据 |
-| white_label_evidence | 同样`[{product,detail,source_ids}]`；须与上述**同一种本轮目标产品**相交 |
+| brand_profile | independent_product下独立商户可为independent／white_label／mixed；collect_brand_stores=true时official_store／brand_exclusive也可准入并分表。纯brand_owner排除，身份分类须有依据。旧white_label_required仍只允许white_label／mixed |
+| white_label_evidence | `[{product,detail,source_ids}]`，记录实际白牌证据。independent_product下可为空，不阻塞其他条件已满足的主营资格；white_label_required旧任务仍须与**同一种本轮目标产品**相交 |
 | contacts | 至少一个可归属、实际可发起联系且有证据的业务入口 |
 | requirement_checks | 每条task.requirements对应`{requirement,status,detail,source_ids}`；main必须matched |
 | supplier_fit | 已知供货约束对应`{constraint,status,detail,source_ids}`；unknown可保留，不得有conflict |
@@ -86,11 +86,15 @@ requirement_checks/supplier_fit的status为matched/unknown/conflict。匹配、�
 
 细地域任务用`location_match:{scope_index:0,relation:"within",detail,source_ids}`。客户city/market/address须匹配该scope；不同名称须用`aliases:{city/market/address:任务规范名}`并附真实对应依据。不能用一个自由文本“within”绕过异地事实；同城不等于场内，商圈周边不自动算市场内。范围不明为candidate，已证不符记录本任务排除。
 
-brand_profile可为white_label、mixed、brand_owner、official_store、brand_exclusive、unknown。名称像品牌不能下事实排除；无Logo/无品牌字段不能证明白牌。
+brand_profile可为independent、white_label、mixed、brand_owner、official_store、brand_exclusive、unknown。名称像品牌不能下事实排除；无Logo／无品牌字段不能证明白牌。品牌店的正式准入仍需其他全部条件，身份不清留candidate；缺白牌不等于缺独立商户身份。
+
+market_sequence正式客户另需`market_assignment:{market_id,relation:"within",detail,source_ids}`，market_id对应本批固定市场，引用真实场内归属证据。城市、市场名称及国家关系须与目录相符；未知市场归属留candidate，不用任务市场自动填写。不同市场同一主体共用稳定ID，不重复计新增。
 
 excluded需`exclusion:{code,origin,detail,source_ids}`。code为brand_owner/official_store/brand_exclusive/outside_scope/product_mismatch/buyer_mismatch/closed/user_excluded/duplicate；origin为evidence或user。事实排除要可读证据，用户明确排除需user_instruction保留指令，不能把模型判断伪装成用户决定。证据不足使用candidate。
 
 非excluded记录不得携带旧exclusion对象。重新纳入被全局排除的主体时，须提供exclusion_resolution:{detail,source_ids}，引用新读取且能解释旧决定为何不再适用的可读证据；成功后旧决定进history，不保留相反的有效状态。仅增加联系方式不能解除品牌排除。
+
+white_label_status和white_label_products由运行层推导，不能由手填状态决定资格。verified（已核）仅表示本任务至少一项产品有足够白牌证据；unverified（待核）表示尚无足够证据。white_label_products只列本任务已证实的白牌产品；单纯白牌冲突使相关产品保持待核。实际读到仅品牌商品时在说明中保留该事实，不从“未见白牌”推成“不存在白牌”，也不影响independent_product下其他准入通过的客户。
 
 ## 联系方式与去重
 
@@ -120,7 +124,7 @@ procurement_access可附{detail,source_ids}，只记录可归属的采购/供应
 
 issues为数组，每项`{issue_id,kind,detail,state,next_action,attempts,next_trigger,source_ids}`，state为open/resolved/blocked。resolved另需resolved_at及解决依据；无需再次执行已解决事项。旧unknowns可迁为未结问题，不因新批传空数组就自动消失。当前表显示未结事项，history保留解决轨迹。
 
-关键问题kind为identity_conflict、location_conflict、white_label_conflict、product_conflict、buyer_conflict、contact_conflict、employee_correction时，open或blocked都会阻止相关正式资格。其他问题可显式blocks_qualification:true；未知采购量等普通未知项不自动阻断。affected_scope_ids/affected_products可界定地域、产品类问题的范围；不填作用所有范围，身份/联系归属冲突始终作用主体。已存关键问题不能通过传空数组、改kind或改为非阻断来绕开，解决须保留新证据。
+关键问题kind为identity_conflict、location_conflict、product_conflict、buyer_conflict、contact_conflict、employee_correction时，open或blocked会阻止相关正式资格。white_label_conflict在旧white_label_required政策下阻止资格；在independent_product下仅使相关白牌结果待核，若同时涉及主体／产品等必需事实，仍按对应问题阻断。其他问题可显式blocks_qualification:true；未知采购量等普通未知项不自动阻断。affected_scope_ids/affected_products可界定地域、产品类问题的范围；不填作用所有范围，身份/联系归属冲突始终作用主体。已存关键问题不能通过传空数组、改kind或改为非阻断来绕开，解决须保留新证据。
 
 queue同样采用稳定issue字段，可附lead_id。attempts为非负整数；next_trigger说明新证据/权限/时间等再次执行条件。不得把队列存在说成后台服务已安排，也不在条件未变化时无限重试。
 
@@ -130,12 +134,36 @@ coverage在**批次顶层**保存，每项`{product,channel,status,attempts,sour
 
 lead.discovered_by为`[{channel,source_ids}]`，记录实际发现路径；多渠道同一主体只算一个新增。覆盖中的客户ID须能追溯到本批记录，准备阶段隔离坏行仍保留拒绝明细与修复事项，不假称覆盖已完成。
 
-批次counts保存本轮main/candidate/excluded数量，并分别记录new_entities、new_qualified_entities（本轮前未在主库出现且本轮合格的规范主体）、updated_entities、requalified（同范围重新合格）、first_qualified（主体首次在该范围合格，包含新主体）、new_contacts、new_sources。新增来源、补一个电话或已有候选晋级不等于新增主体。这些指标有交叉，不相加成客户总数；不要用main总数冒充新增客户。
+批次counts保存本轮main/candidate/excluded数量；新政策另列independent_main与brand_store_main，品牌店不充独立商户数量目标。另分别记录new_entities、new_qualified_entities（本轮前未在主库出现且本轮合格的规范主体）、updated_entities、requalified（同范围重新合格）、first_qualified（主体首次在该范围合格，包含新主体）、new_contacts、new_sources。新增来源、补一个电话或已有候选晋级不等于新增主体。这些指标有交叉，不相加成客户总数；不要用main总数冒充新增客户。
 
 ## 保存与交付
 
 同一主库一个写入者。commit持锁核snapshot/hash，备份原始主库后原子替换并读回；冲突时重读、合并、另建基线，不强改旧hash。相同payload重试幂等。详细目录、断点及纠错在[persistence.md](persistence.md)。
 
-export导出本批冻结版本；export-current --batch-id <ID>或--scope-id <SCOPE>导出该范围当前有效客户。当前表从对应资格的证据快照取产品/地区事实，合并最新联系、人工备注、未结问题与主体状态，按当前日期重算评级，不借另一任务最新事实，不修改主库或历史表。旧批缺少可重建的范围证据时如实待核，不能猜。均生成可开发客户、待核线索、来源证据、采集说明；先按本轮有效业务偏好（新项目默认买家类型）排序，再按A/B；无额外偏好时A在B前。联系显示核验时效，未结问题与资格原因可读，覆盖和增量计数不藏在原始JSON里。排除明细留主库，计数留说明。零结果也据实导出。
+export导出本批冻结版本；export-current --batch-id <ID>或--scope-id <SCOPE>导出该范围当前有效客户。当前表从对应资格的证据快照取产品/地区事实，合并最新联系、人工备注、未结问题与主体状态，按当前日期重算评级，不借另一任务最新事实，不修改主库或历史表。旧批缺少可重建的范围证据时如实待核，不能猜。新政策市场文件生成可开发客户、品牌店、待核线索、来源证据、采集说明；可开发客户只列独立商户，品牌店独立表。旧政策保留历史视图。先按本轮有效业务偏好（新项目默认买家类型）排序，再按A/B；无额外偏好时A在B前。联系显示核验时效，未结问题与资格原因可读，覆盖和增量计数不藏在原始JSON里。排除明细留主库，计数留说明。market_sequence每市场独立Excel，并提供国家／城市及城市／市场进度总览，所有市场共用主库查重；市场未完成时标阶段结果。零结果也据实导出。
 
 所有单元格按文本保存，编号/电话前缀不丢，文本不执行公式。交付前独立回读工作表、计数、来源、联系方式；有渲染工具则检查显示。脚本不能保证事实真伪或每国一定有足量客户。
+
+## 国家、城市和市场目录
+
+market_sequence的collection_plan包含market_directory：
+
+- countries：`{country_id,name,order}`；国家名称与task.countries一致，全球任务可逐国补充。
+- cities：`{city_id,country_id,name,order,source_ids}`；可读证据支持该城市及国家关系。
+- markets：`{market_id,city_id,name,order,priority_basis,source_ids,size_source_ids,boundary}`；priority_basis说明有据顺序，boundary是实际市场／目录边界，size_source_ids可在未知规模时为空。
+- coverage：`{status:"partial"|"complete",detail,source_ids}`；默认partial，只有真实证据支持指定地区目录完整才可complete。全球目录不得宣称全量完整。
+
+同一父级order唯一，已保存ID、名称、父级及顺序不能改名重排绕过当前市场，已发现节点不能删除。每route关联market_id；preflight_city_id指当前城市，六类渠道和联系生态适用该城市。batch_market_id由计划固定本批市场，不因该市场受阻、暂缓或数量达标改到下一市场。
+
+市场完成由实际进度命令登记；真实完成后workflow continue才将下一批推进到后续市场，跨城重新预研。目录中已列市场全部完成也不自动表示国家／城市目录完整，仍须保留未预研范围和来源限制。详见[研究进度](research-progress.md)。
+
+## 按市场打包与进度总览命令
+
+```text
+python3 <SKILL_DIR>/scripts/leadkit_market.py export --workspace <JSON工作区> --batch-id <已提交参考批次> --output-dir <新交付目录>
+python3 <SKILL_DIR>/scripts/leadkit_market.py overview --plan <目录JSON> --output <新总览.xlsx>
+```
+
+export按参考批及之前同一任务范围的已提交记录和有据市场归属分包，输出`00-地区与市场进度.xlsx`及国家／城市目录下的市场工作簿；有未知归属记录时另输出`待市场定位.xlsx`，不塞入任一市场。使用新目录，不覆盖旧交付，不修改主库。每市场保留可开发客户、品牌店、待核线索、来源证据、采集说明。
+
+overview接收目录本体或含market_directory的JSON对象，只生成国家／城市和城市／市场进度总览，不创建客户主库，已有Excel项目可用。总览列的是实际已登记范围，完整性未知须明确；未采市场不能显示为完成。交付仍须回读并登记。

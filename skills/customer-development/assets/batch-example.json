@@ -3,7 +3,7 @@
   "batch_id": "example-only",
   "base_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "task": {
-    "request": "这是虚构的已提供线索补证结构示例，不是真实客户。全新地区发现必须从snapshot生成默认region_size_ladder任务并建立真实研究账本，不能复制本例绕过渠道预研。",
+    "request": "这是虚构的已提供线索补证结构示例，不是真实客户。全新地区发现必须从snapshot生成默认market_sequence任务并建立真实研究账本，不能复制本例绕过渠道预研。",
     "countries": [
       "测试国"
     ],
@@ -23,8 +23,9 @@
         "相关线上商家",
         "相关零售商"
       ],
-      "brand_policy": "white_label_required",
-      "supplier_constraints": {}
+      "brand_policy": "independent_product",
+      "supplier_constraints": {},
+      "collect_brand_stores": true
     },
     "activity_max_age_days": 180,
     "geo_scope": [

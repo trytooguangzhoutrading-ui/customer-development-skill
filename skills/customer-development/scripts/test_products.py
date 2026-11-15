@@ -74,6 +74,27 @@ class ProductScopeTests(unittest.TestCase):
             self.commit(p)
         self.assertFalse(core.load_master(self.root)[0]["leads"])
 
+    def test_new_policy_product_admission_and_white_label_review_are_independent(self):
+        packet = self.packet(targets=["智能手表表带", "智能手表"])
+        packet["task"]["customer_profile"].update(brand_policy="independent_product", collect_brand_stores=True)
+        lead = packet["leads"][0]
+        lead["brand_profile"] = "independent"
+        lead["white_label_evidence"][0]["product"] = "智能手表"
+        self.commit(packet)
+        saved = core.load_master(self.root)[0]["batches"]["scope"]["lead_snapshots"][0]
+        self.assertEqual(saved["qualified_products"], ["智能手表表带"])
+        self.assertEqual(saved["white_label_products"], [])
+        self.assertEqual(saved["white_label_status"], "unverified")
+        packet = self.packet("strap-white", targets=["智能手表表带"])
+        packet["task"]["customer_profile"].update(brand_policy="independent_product", collect_brand_stores=True)
+        self.commit(packet)
+        master = core.load_master(self.root)[0]
+        saved = master["batches"]["strap-white"]["lead_snapshots"][0]
+        self.assertEqual(saved["white_label_products"], ["智能手表表带"])
+        self.assertEqual(saved["white_label_status"], "verified")
+        previous = core.current_scope_view(master, core.scope_key(master["batches"]["scope"]["task"]))[0]
+        self.assertEqual(previous["white_label_products"], [])
+
     def test_audio_only_is_incidental_not_main_and_can_later_qualify_for_audio_task(self):
         p = self.packet(product="蓝牙耳机")
         with self.assertRaisesRegex(core.LeadkitError, "requested product"):
