@@ -133,6 +133,22 @@ class WorkflowTests(unittest.TestCase):
         result = flow.snapshot(self.root, "explicit-old-strategy", {"collection_strategy": "region_size_ladder"})
         self.assertEqual(core.read_json(result["batch_path"])["task"]["collection_strategy"], "region_size_ladder")
 
+    def test_single_sheet_default_and_old_continuation_keep_separate_layouts(self):
+        result = flow.snapshot(self.root, "single-default")
+        self.assertEqual(core.read_json(result["batch_path"])["task"]["output_layout"], "single_sheet")
+        packet = self.packet("historical-layout")
+        self.assertNotIn("output_layout", packet["task"])
+        core.commit(self.root, packet)
+        frozen = copy.deepcopy(core.load_master(self.root)[0]["batches"]["historical-layout"])
+        continued = flow.continue_task(self.root, "historical-layout", "legacy-continued")
+        task = continued["packet"]["task"]
+        self.assertEqual(task["output_layout"], "legacy")
+        self.assertEqual(core.scope_key(task), core.scope_key(packet["task"]))
+        self.assertEqual(core.load_master(self.root)[0]["batches"]["historical-layout"], frozen)
+        with self.assertRaisesRegex(core.LeadkitError, "output_layout"):
+            flow.snapshot(self.root, "bad-layout", {"output_layout":"many_new_tables"})
+        self.assertFalse((self.root / "research/bad-layout").exists())
+
     def test_policy_review_detects_new_brand_and_market_defaults_without_changing_old_task(self):
         task = self.packet()["task"]
         config = core.read_json(self.root / "config.json")
@@ -381,7 +397,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(updated.endswith("# 附加规则\n本地限制保持不变。\n"))
         self.assertIn("国家→城市／地区→批发市场／批发城", updated)
         self.assertIn("预算用尽继续当前市场", updated)
-        self.assertIn("每个市场独立交付 Excel", updated)
+        self.assertIn("一个 Excel、一个客户总表", updated)
+        self.assertIn("不拆文件或工作表", updated)
         self.assertIn("历史任务保留其已冻结策略", updated)
         self.assertNotIn("再按有据的大型、中型、小型路线逐层建立商户池", updated)
         self.assertFalse(flow.setup_project(self.root, dedicated=True)["changed"])

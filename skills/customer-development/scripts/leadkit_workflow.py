@@ -142,7 +142,7 @@ def snapshot(root, batch_id, overrides=None):
     core.require(isinstance(supply, dict), "config.supplier_profile must be an object")
     brand_policy = config.get("brand_policy", "independent_product")
     task = {"products": products, "supplementary_products": copy.deepcopy(config.get("supplementary_products", [])), "customer_profile": {"buyer_types": buyers, "brand_policy": brand_policy, "collect_brand_stores": config.get("collect_brand_stores", brand_policy == "independent_product"), "supplier_constraints": supply}, "activity_max_age_days": config.get("activity_max_age_days", 180)}
-    for key, default in {"mode": "new", "target_count": 20, "work_budget": {"max_attempts": 80, "max_minutes": 45}, "business_priorities": [], "preferred_buyer_types": [], "collection_strategy": "market_sequence", "completion_policy": "coverage"}.items():
+    for key, default in {"mode": "new", "target_count": 20, "work_budget": {"max_attempts": 80, "max_minutes": 45}, "business_priorities": [], "preferred_buyer_types": [], "collection_strategy": "market_sequence", "completion_policy": "coverage", "output_layout": "single_sheet"}.items():
         task[key] = copy.deepcopy(config.get(key, default))
     if "target_metric" in config:
         task["target_metric"] = config["target_metric"]
@@ -171,6 +171,7 @@ def snapshot(root, batch_id, overrides=None):
         core.string_list(task.get("supplementary_products", []), "Company supplementary_products")
         task["supplementary_products"] = [p for p in task.get("supplementary_products", []) if p not in task["products"]]
     core.validate_product_scope(task)
+    core.require(task.get("output_layout") in {"single_sheet", "legacy"}, "Invalid task.output_layout")
     if "preferred_buyer_types" not in overrides and "preferred_buyer_types" not in defaults:
         allowed = task.get("customer_profile", {}).get("buyer_types", [])
         task["preferred_buyer_types"] = [buyer for buyer in task.get("preferred_buyer_types", []) if buyer in allowed]
@@ -382,6 +383,7 @@ def continue_task(root, batch_id=None, new_batch_id=None):
         # Adding new defaults must not silently alter a saved task's gates.
         task.setdefault("collection_strategy", "legacy")
         task.setdefault("completion_policy", "target_or_coverage")
+        task.setdefault("output_layout", "legacy")
         old_queue_ids = {q["issue_id"] for q in previous.get("queue", [])}
         queue = [copy.deepcopy(q) for q in master.get("queue", []) if q["issue_id"] in old_queue_ids and q.get("state") != "resolved"]
         if new_batch_id is None:
@@ -463,7 +465,7 @@ def setup_project(root, dedicated=False):
             'JSON主库按已绑定工作区 execution/task-index.json 定位任务并用 workflow continue接续；Excel主库按原表稳定ID、记录和断点增量处理，不迁移或初始化第二套JSON主库。',
             '新增客户必须对照主库和全部补充查重源；仅安装技能不共享历史数据，缺少文件不得宣称企业净新增。',
             '新采集任务先按国家→城市／地区→批发市场／批发城建立有来源的目录并完成当前城市渠道与联系生态预研，再按有据的市场优先顺序逐个采集场内商户；目录只说明已研究范围，不把局部目录当作全国完整目录。历史任务保留其已冻结策略，新规则另建任务接续。',
-            '当前市场的已观察目录和所有已见入口完成后，才在下一批推进第二、第三市场；预算用尽继续当前市场，未读、受阻或暂缓均不算完成，不静默跳市场。每个市场独立交付 Excel，独立商户与品牌店分列；市场归属待核的主体保留待核，不冒入场内正式客户。',
+            '当前市场的已观察目录和所有已见入口完成后，才在下一批推进第二、第三市场；预算用尽继续当前市场，未读、受阻或暂缓均不算完成，不静默跳市场。新任务仅交付一个 Excel、一个客户总表，国家、城市、市场、独立商户／品牌店及正式／待核用列筛选，不拆文件或工作表；同一主体合为一行保留全部有据市场关系，市场归属待核不得冒入场内正式客户。',
             '员工主要接收最终客户 Excel、数量与必要限制；内部步骤和校验保存在本地。未核实证据不得伪造成客户，必须执行技能的准备、资格、去重和提交校验。',
             '此项目只做客户研究，不发送消息；员工纠错后按当前状态导出新表，历史交付保持不变。',
             MANAGED_END,

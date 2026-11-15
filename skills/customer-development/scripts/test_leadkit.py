@@ -12,6 +12,14 @@ from xml.etree import ElementTree as ET
 import leadkit as kit
 
 
+def single_sheet_rows(path):
+    with zipfile.ZipFile(path) as archive:
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        names = [x.attrib["name"] for x in workbook.find(kit.tag("sheets"))]
+        rows = ET.fromstring(archive.read("xl/worksheets/sheet1.xml")).find(kit.tag("sheetData"))
+        return names, [["".join(c.itertext()) for c in row] for row in rows]
+
+
 class LeadkitTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -27,6 +35,7 @@ class LeadkitTests(unittest.TestCase):
         packet["task"].update(request="仅测试：采集测试国智能眼镜商户", countries=["测试国"], products=["智能眼镜"], collection_strategy="legacy", completion_policy="target_or_coverage", business_priorities=[], preferred_buyer_types=[], supplementary_products=[])
         # Existing regressions intentionally exercise the frozen historical policy.
         packet["task"]["customer_profile"].update(brand_policy="white_label_required", collect_brand_stores=False)
+        packet["task"].pop("output_layout", None)
         packet["sources"] = [{"source_id": sid, "url": "https://example.invalid/merchant", "title": "虚构测试原文", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "仅测试。虚构商户经营智能眼镜，测试国公开业务电话 +00123456789。"}]
         packet["leads"] = [{"lead_id": lid, "name": "虚构测试商户", "country": "测试国", "city": "测试城", "address": "仅测试地址", "status": "main", "identity_source_ids": [sid], "location_source_ids": [sid], "product_evidence": [{"product": "智能眼镜", "detail": "虚构测试型号", "source_ids": [sid]}], "contacts": [{"kind": "phone", "value": "+00123456789", "role": "商户公开业务电话", "attribution": "虚构商户原文同页", "source_ids": [sid]}], "reason": "仅用于离线测试", "unknowns": ["采购权限未核"], "manual_notes": "人工初始记录"}]
         packet["sources"].append({"source_id": "REG-" + sid, "url": "https://example.invalid/region", "title": "虚构地区研究", "read_at": "2026-11-13T10:00:00+08:00", "level": "current_original", "excerpt": "虚构测试国使用测试语言，有商户目录；全部虚构。"})
@@ -270,6 +279,80 @@ class LeadkitTests(unittest.TestCase):
         with self.assertRaises(kit.LeadkitError):
             kit.init_workspace(self.root)
         self.assertEqual(original, (self.root / "execution/master.json").read_bytes())
+
+    def test_single_sheet_lists_formal_brand_and_pending_with_traceable_facts(self):
+        packet = self.independent_packet()
+        packet["task"]["output_layout"] = "single_sheet"
+        packet["leads"][0]["product_evidence"].append({"product":"蓝牙耳机", "detail":"同店附带品类，不充本轮主营", "source_ids":["SRC-001"]})
+        for index, status, brand in ((2, "main", "official_store"), (3, "candidate", "unknown")):
+            lead = copy.deepcopy(packet["leads"][0])
+            lead.update(lead_id="TEST-00" + str(index), name="虚构单表商户" + str(index), status=status, brand_profile=brand)
+            lead["contacts"][0]["value"] = "+0012345678" + str(index)
+            packet["leads"].append(lead)
+        self.commit(packet)
+        before = (self.root / "execution/master.json").read_bytes()
+        output = self.root / "outputs/single.xlsx"
+        result = kit.export_batch(self.root, "new-policy", output)
+        names, rows = single_sheet_rows(output)
+        self.assertEqual(names, ["客户总表"])
+        self.assertEqual((result["sheets"], result["customer_rows"]), (1, 3))
+        values = {row[5]: dict(zip(rows[0], row)) for row in rows[1:]}
+        self.assertEqual(values["TEST-001"]["状态"], "正式")
+        self.assertEqual(values["TEST-002"]["商户类型"], "品牌店")
+        self.assertEqual(values["TEST-003"]["状态"], "待核")
+        self.assertEqual(values["TEST-001"]["白牌核实状态"], "待核")
+        self.assertEqual(values["TEST-001"]["主营／目标产品"], "智能眼镜")
+        self.assertIn("https://example.invalid/merchant", values["TEST-001"]["来源URL"])
+        self.assertIn("虚构商户经营智能眼镜", values["TEST-001"]["可追溯事实说明"])
+        self.assertTrue(values["TEST-003"]["下一步"])
+        self.assertEqual(result["counts"]["independent_main"], 1)
+        self.assertEqual(result["counts"]["brand_store_main"], 1)
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+
+    def test_single_sheet_empty_result_is_explanatory_not_a_customer(self):
+        packet = self.independent_packet()
+        packet["task"]["output_layout"] = "single_sheet"
+        packet["leads"][0].update(status="excluded", brand_profile="brand_owner", exclusion={"code":"brand_owner", "origin":"evidence", "detail":"纯品牌方", "source_ids":["SRC-001"]})
+        self.commit(packet)
+        output = self.root / "outputs/empty-single.xlsx"
+        result = kit.export_batch(self.root, "new-policy", output)
+        names, rows = single_sheet_rows(output)
+        self.assertEqual(names, ["客户总表"])
+        self.assertEqual(result["customer_rows"], 0)
+        self.assertEqual(rows[1][4], "说明（非客户）")
+        self.assertEqual(rows[1][5], "")
+        self.assertIn("后台排除 1", rows[1][-1])
+        self.assertTrue(rows[1][14])
+
+    def test_output_layout_is_not_a_qualification_scope_or_historical_rewrite(self):
+        packet = self.independent_packet()
+        original_scope = kit.scope_key(packet["task"])
+        self.commit(packet)
+        frozen = copy.deepcopy(kit.load_master(self.root)[0]["batches"]["new-policy"])
+        packet["task"]["output_layout"] = "single_sheet"
+        self.assertEqual(kit.scope_key(packet["task"]), original_scope)
+        output = self.root / "outputs/frozen-layout.xlsx"
+        self.assertEqual(kit.export_batch(self.root, "new-policy", output)["sheets"], 5)
+        self.assertEqual(kit.load_master(self.root)[0]["batches"]["new-policy"], frozen)
+
+    def test_current_single_sheet_uses_current_notes_without_rewriting_frozen_batch(self):
+        packet = self.independent_packet()
+        packet["task"]["output_layout"] = "single_sheet"
+        self.commit(packet)
+        master = kit.load_master(self.root)[0]
+        frozen = copy.deepcopy(master["batches"]["new-policy"])
+        master["leads"]["TEST-001"]["manual_notes"] = "员工当前备注"
+        kit.safe_write(self.root / "execution/master.json", master)
+        before = (self.root / "execution/master.json").read_bytes()
+        output = self.root / "outputs/current-single.xlsx"
+        result = kit.export_current(self.root, output, batch_id="new-policy")
+        names, rows = single_sheet_rows(output)
+        self.assertEqual(names, ["客户总表"])
+        self.assertEqual(result["view"], "current")
+        self.assertIn("员工当前备注", rows[1])
+        self.assertIn("当前有效资格", rows[1][-1])
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+        self.assertEqual(kit.load_master(self.root)[0]["batches"]["new-policy"], frozen)
 
     def test_commit_is_idempotent_and_stable(self):
         packet = self.packet()

@@ -44,7 +44,8 @@
     "business_priorities": [],
     "preferred_buyer_types": [],
     "collection_strategy": "provided_leads",
-    "completion_policy": "target_or_coverage"
+    "completion_policy": "target_or_coverage",
+    "output_layout": "single_sheet"
   },
   "sources": [
     {

@@ -76,7 +76,7 @@ main需要以下所有条件；不能用分数抵消缺项：
 | location_source_ids | 实际经营地域依据，送货范围不等于地址 |
 | buyer_type / buyer_type_source_ids | 类型属于本轮画像，且有可读证据 |
 | product_evidence | `[{product,detail,source_ids}]`，至少一种本轮目标产品有可读依据 |
-| brand_profile | independent_product下独立商户可为independent／white_label／mixed；collect_brand_stores=true时official_store／brand_exclusive也可准入并分表。纯brand_owner排除，身份分类须有依据。旧white_label_required仍只允许white_label／mixed |
+| brand_profile | independent_product下独立商户可为independent／white_label／mixed；collect_brand_stores=true时official_store／brand_exclusive也可准入并在同表分类。纯brand_owner排除，身份分类须有依据。旧white_label_required仍只允许white_label／mixed |
 | white_label_evidence | `[{product,detail,source_ids}]`，记录实际白牌证据。independent_product下可为空，不阻塞其他条件已满足的主营资格；white_label_required旧任务仍须与**同一种本轮目标产品**相交 |
 | contacts | 至少一个可归属、实际可发起联系且有证据的业务入口 |
 | requirement_checks | 每条task.requirements对应`{requirement,status,detail,source_ids}`；main必须matched |
@@ -140,7 +140,7 @@ lead.discovered_by为`[{channel,source_ids}]`，记录实际发现路径；多�
 
 同一主库一个写入者。commit持锁核snapshot/hash，备份原始主库后原子替换并读回；冲突时重读、合并、另建基线，不强改旧hash。相同payload重试幂等。详细目录、断点及纠错在[persistence.md](persistence.md)。
 
-export导出本批冻结版本；export-current --batch-id <ID>或--scope-id <SCOPE>导出该范围当前有效客户。当前表从对应资格的证据快照取产品/地区事实，合并最新联系、人工备注、未结问题与主体状态，按当前日期重算评级，不借另一任务最新事实，不修改主库或历史表。旧批缺少可重建的范围证据时如实待核，不能猜。新政策市场文件生成可开发客户、品牌店、待核线索、来源证据、采集说明；可开发客户只列独立商户，品牌店独立表。旧政策保留历史视图。先按本轮有效业务偏好（新项目默认买家类型）排序，再按A/B；无额外偏好时A在B前。联系显示核验时效，未结问题与资格原因可读，覆盖和增量计数不藏在原始JSON里。排除明细留主库，计数留说明。market_sequence每市场独立Excel，并提供国家／城市及城市／市场进度总览，所有市场共用主库查重；市场未完成时标阶段结果。零结果也据实导出。
+export导出本批冻结版本；export-current --batch-id <ID>或--scope-id <SCOPE>导出该范围当前有效客户。当前表从对应资格的证据快照取产品/地区事实，合并最新联系、人工备注、未结问题与主体状态，按当前日期重算评级，不借另一任务最新事实，不修改主库或历史表。旧批缺少可重建的范围证据时如实待核，不能猜。新任务output_layout=single_sheet，仅生成一个客户总表；以客户类型和资格状态区分独立商户、品牌店和待核线索，同排保留来源。无output_layout的冻结旧任务保留历史布局；输出布局不改变资格scope。先按本轮有效业务偏好（新项目默认买家类型）排序，再按A/B；无额外偏好时A在B前。联系显示核验时效，未结问题与资格原因可读，覆盖和增量计数不藏在原始JSON里。排除明细留主库，计数留说明。market_sequence在同一总表保留国家／城市／市场字段和当前市场进度；跨市场同主体一行，全部已核市场关系保留，未知归属不猜配；市场未完成时标阶段结果。零结果也据实导出。
 
 所有单元格按文本保存，编号/电话前缀不丢，文本不执行公式。交付前独立回读工作表、计数、来源、联系方式；有渲染工具则检查显示。脚本不能保证事实真伪或每国一定有足量客户。
 
@@ -160,10 +160,10 @@ market_sequence的collection_plan包含market_directory：
 ## 按市场打包与进度总览命令
 
 ```text
-python3 <SKILL_DIR>/scripts/leadkit_market.py export --workspace <JSON工作区> --batch-id <已提交参考批次> --output-dir <新交付目录>
+python3 <SKILL_DIR>/scripts/leadkit_market.py export --workspace <JSON工作区> --batch-id <已提交参考批次> --output <统一客户表.xlsx>
 python3 <SKILL_DIR>/scripts/leadkit_market.py overview --plan <目录JSON> --output <新总览.xlsx>
 ```
 
-export按参考批及之前同一任务范围的已提交记录和有据市场归属分包，输出`00-地区与市场进度.xlsx`及国家／城市目录下的市场工作簿；有未知归属记录时另输出`待市场定位.xlsx`，不塞入任一市场。使用新目录，不覆盖旧交付，不修改主库。每市场保留可开发客户、品牌店、待核线索、来源证据、采集说明。
+export --output按参考批及之前同一任务范围的已提交记录合并为一个Excel、一个客户总表；同主体跨市场只一行，保留全部有据市场关系，未知归属标待定位。选择新文件名，旧交付不覆盖，主库不修改。--output-dir仅供明确要求旧分包布局的兼容调用；overview用于内部目录核对，不另交第二份员工表格。
 
 overview接收目录本体或含market_directory的JSON对象，只生成国家／城市和城市／市场进度总览，不创建客户主库，已有Excel项目可用。总览列的是实际已登记范围，完整性未知须明确；未采市场不能显示为完成。交付仍须回读并登记。

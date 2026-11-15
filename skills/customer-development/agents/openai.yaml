@@ -1,6 +1,6 @@
 interface:
   display_name: "客户自动采集"
-  short_description: "按国家城市逐市场采集主营商户，白牌单独标记，品牌店分表并交付Excel"
-  default_prompt: "使用 $customer-development 沿用本项目规则和统一主库，按国家、城市、市场逐个采集主营商户，白牌只作标记，品牌店独立列示，每个市场交付Excel并更新进度总览。"
+  short_description: "按国家城市逐市场采集主营商户，白牌单独标记，品牌店分类并交付一张客户总表"
+  default_prompt: "使用 $customer-development 沿用本项目规则和统一主库，按国家、城市、市场逐个采集主营商户，白牌只作标记，品牌店独立列示，交付一个Excel中的一张客户总表，按国家城市市场和客户类型筛选并保留当前市场进度。"
 policy:
   allow_implicit_invocation: true

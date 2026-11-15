@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 PRIMARY_PRODUCTS = ["智能眼镜", "智能手表", "智能手表表带", "智能手环", "智能戒指"]
 SUPPLEMENTARY_PRODUCTS = ["蓝牙耳机", "蓝牙音响"]
 PRODUCTS = PRIMARY_PRODUCTS + SUPPLEMENTARY_PRODUCTS
@@ -135,6 +135,7 @@ def init_workspace(root):
         for name in ("execution", "research", "outputs"):
             (root / name).mkdir()
         config = {"schema_version": 1, "products": PRIMARY_PRODUCTS, "supplementary_products": SUPPLEMENTARY_PRODUCTS, "default_buyer_types": DEFAULT_BUYER_TYPES, "preferred_buyer_types": ["批发商", "进口商", "分销商", "当地市场商户"], "business_priorities": ["buyer_type"], "brand_policy": "independent_product", "collect_brand_stores": True, "outreach_enabled": False, "employee_output": "xlsx", "default_region": None, "supplier_constraints": {}, "activity_max_age_days": 180, "rules_version": VERSION}
+        config["output_layout"] = "single_sheet"
         safe_write(root / "config.json", config)
         master = {"schema_version": 1, "created_at": now(), "updated_at": now(), "leads": {}, "sources": {}, "batches": {}}
         safe_write(root / "execution" / "master.json", master)
@@ -157,6 +158,7 @@ def basic_snapshot(root, batch_id):
         baseline = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "created_at": now(), "lead_ids": sorted(master["leads"])}
         safe_write(target / "snapshot.json", baseline)
         packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRIMARY_PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "independent_product", "collect_brand_stores": True, "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
+        packet["task"]["output_layout"] = "single_sheet"
         safe_write(target / "batch.json", packet)
     return {"batch_id": batch_id, "base_sha256": sha, "batch_path": str(target / "batch.json"), "snapshot_path": str(target / "snapshot.json")}
 
@@ -291,6 +293,7 @@ def validate_packet(packet, master):
     require(isinstance(packet.get("base_sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", packet["base_sha256"]), "base_sha256 must come from snapshot")
     task = packet.get("task")
     require(isinstance(task, dict), "task is required")
+    require(task.get("output_layout", "legacy") in {"single_sheet", "legacy"}, "Invalid task.output_layout")
     nonempty(task.get("request"), "task.request")
     for field in ("countries", "products", "requirements"):
         string_list(task.get(field), "task." + field)
@@ -1308,6 +1311,9 @@ def export_batch(root, batch_id, output):
     master, _ = load_master(root)
     require(batch_id in master["batches"], "Unknown committed batch")
     batch = master["batches"][batch_id]
+    if batch["task"].get("output_layout") == "single_sheet" and batch["task"].get("collection_strategy") == "market_sequence":
+        import leadkit_market as market
+        batch = market.single_view(master, batch_id)
     return export_view(master, batch, batch_id, output)
 
 
@@ -1379,11 +1385,134 @@ def export_current(root, output, scope_id=None, batch_id=None):
                 counts=result_counts(leads, reference["task"]))
     view["limitations"] = append_unique(view.get("limitations", []), ["当前视图按各资格范围原证据与主库当前状态重建；不会重新联网核实。历史批次及历史导出保持不变。"])
     view["queue"] = [q for q in master.get("queue", []) if q.get("lead_id") in {x["lead_id"] for x in leads}]
+    if view["task"].get("output_layout") == "single_sheet" and view["task"].get("collection_strategy") == "market_sequence":
+        import leadkit_market as market
+        latest_market_id = max(((bid, b) for bid, b in master["batches"].items() if b.get("scope_id") == scope_id and b.get("task", {}).get("collection_strategy") == "market_sequence"), key=lambda item: market._commit_time(item[1]))[0]
+        history = market.single_view(master, latest_market_id)
+        view["research_summary"] = copy.deepcopy(history.get("research_summary", {}))
+        view["market_context"] = copy.deepcopy(history.get("market_context", {}))
+        relations = {}
+        for historical in history["lead_snapshots"]:
+            canonical = canonical_entity(historical["lead_id"], master["leads"])
+            relations[canonical] = append_unique(relations.get(canonical, []), historical.get("market_relations", []))
+        for lead in leads:
+            lead["market_relations"] = copy.deepcopy(relations.get(lead["lead_id"], []))
+        timeline = sorted(((bid, b) for bid, b in master["batches"].items() if b.get("committed_at")), key=lambda item: (market._commit_time(item[1]), item[0]))
+        identities = market._historical_entities(timeline)
+        reviews = market._entity_reviews(timeline, identities, master["sources"])
+        for lead in leads:
+            market.apply_entity_review(lead, reviews.get(canonical_entity(lead["lead_id"], identities)), master["batches"])
+        view["counts"] = result_counts(leads, reference["task"])
     result = export_view(master, view, batch_id, output)
     return dict(result, view="current", scope_id=scope_id)
 
 
+def verified_market_relations(lead, sources):
+    """Display only sourced membership, never infer a market from a city."""
+    relations = copy.deepcopy(lead.get("market_relations", []))
+    if "market_relations" not in lead and lead.get("market") and any(sources.get(s, {}).get("level") in STRONG for s in lead.get("location_source_ids", [])):
+        relations = [{"country": lead.get("country", ""), "city": lead.get("city", ""), "market": lead["market"], "relation": "within", "source_ids": lead["location_source_ids"], "detail": "记录中的有据市场位置"}]
+    return [r for r in relations if r.get("relation") == "within" and r.get("market")
+            and any(sources.get(s, {}).get("level") in STRONG for s in r.get("source_ids", []))]
+
+
+def market_progress_note(batch):
+    if batch["task"].get("collection_strategy") != "market_sequence":
+        return ""
+    summary = batch.get("research_summary") or {}
+    sequence = summary.get("market_sequence") or {}
+    active_id = sequence.get("batch_market_id") or sequence.get("active_market_id")
+    context = copy.deepcopy(sequence.get("active_market") or {})
+    context.update(batch.get("market_context") or {})
+    directory = sequence.get("directory") or {}
+    node = next((m for m in directory.get("markets", []) if m.get("market_id") == active_id), {})
+    context = dict(node, **context)
+    market_name = context.get("market") or context.get("name") or "尚未选定；先补目录／预研"
+    state = context.get("state", "complete" if sequence.get("active_market_complete") else "unknown")
+    if state == "open" and active_id:
+        state = "active"
+    labels = {"open": "未开始", "active": "采集中，未完成", "complete": "已完成登记边界", "blocked": "受阻未完成", "needs_research": "待预研，未完成", "deferred": "暂缓未完成", "unknown": "未记录，不视为完成"}
+    next_action = (context.get("progress") or {}).get("next_action") or context.get("next_action") or summary.get("next_action") or "未记录具体下一步，须从保存账本恢复"
+    parts = ["当前市场：" + "／".join(x for x in (context.get("country"), context.get("city"), market_name) if x),
+             "状态：" + labels.get(state, state), "覆盖边界：" + context.get("boundary", "未记录完整边界"), "下一步：" + next_action]
+    for field, label in (("next_route_id", "下一路线"), ("pending_entry_ids", "未读入口"), ("blocked_entry_ids", "受阻入口")):
+        value = summary.get(field)
+        if value:
+            parts.append(label + "：" + ("、".join(value) if isinstance(value, list) else value))
+    return "；".join(parts)
+
+
+def export_single_sheet(master, batch, batch_id, output):
+    """One employee table; qualification stays in the saved record, not styling."""
+    task, sources = batch["task"], master["sources"]
+    header = ["国家", "城市", "市场（已核关系）", "商户类型", "状态", "客户编号", "商户名称", "主营／目标产品", "白牌核实状态", "已核白牌产品", "公开业务入口", "来源URL", "可追溯事实说明", "待核缺口", "下一步", "地址／精度", "经营角色", "开发优先级", "人工备注", "市场关系依据", "交付口径"]
+    widths = [20, 24, 42, 24, 16, 22, 32, 36, 18, 30, 58, 65, 85, 52, 52, 42, 24, 18, 42, 75, 75]
+    # A pending observation must not hide a separately qualified record of the
+    # same stable entity. Market delivery already resolves historical aliases.
+    selected = {}
+    for lead in batch.get("lead_snapshots", []):
+        if lead.get("status") not in {"main", "candidate"}:
+            continue
+        previous = selected.get(lead["lead_id"])
+        if previous is None or previous["status"] != "main":
+            selected[lead["lead_id"]] = lead
+    counts = result_counts(list(selected.values()), task)
+    counts["excluded"] = batch.get("counts", {}).get("excluded", sum(x.get("status") == "excluded" for x in batch.get("lead_snapshots", [])))
+    view_label = "当前有效资格" if batch.get("view") == "current" else "截至参考批次的市场合并结果" if batch.get("view") == "market_delivery" else "本批冻结结果"
+    boundary = "%s；批次 %s；正式 %d，待核 %d，后台排除 %d。正式表示满足研究条件，未确认采购意愿或联系可达；品牌店不充独立商户目标。" % (view_label, batch_id, counts["main"], counts["candidate"], counts["excluded"])
+    progress_note = market_progress_note(batch)
+    if progress_note:
+        boundary += " " + progress_note + "。"
+    if batch.get("limitations"):
+        boundary += " 限制：" + "；".join(batch["limitations"])
+    rows = []
+    labels = {"independent": "独立商户", "brand_store": "品牌店", "unclassified": "商户类型待核"}
+    for lead in selected.values():
+        relations = verified_market_relations(lead, sources)
+        countries = sorted({r.get("country") for r in relations if r.get("country")} | {lead.get("country", "")})
+        cities = sorted({r.get("city") for r in relations if r.get("city")} | {lead.get("city", "")})
+        markets = sorted({r["market"] for r in relations})
+        segment = collection_segment(lead, task)
+        segments = lead.get("collection_segments") or [segment]
+        kind = "／".join(labels.get(s, "商户类型待核") for s in dict.fromkeys(segments))
+        linked = set(lead_source_ids(lead))
+        for relation in relations:
+            linked.update(relation.get("source_ids", []))
+        linked.update(lead.get("export_source_ids", []))
+        linked = sorted(s for s in linked if s in sources)
+        review = {k: lead[k] for k in ("white_label_status", "white_label_products")} if all(k in lead for k in ("white_label_status", "white_label_products")) else white_label_review(lead, task, sources)
+        issues = [q for q in lead.get("issues", []) + batch.get("queue", []) if q.get("state") != "resolved" and q.get("lead_id", lead["lead_id"]) == lead["lead_id"]]
+        gaps = append_unique(lead.get("unknowns", []), [q["detail"] for q in issues if q.get("detail")])
+        if not relations:
+            gaps = append_unique(gaps, ["市场归属待核；未按城市或渠道名称推定市场"])
+        actions = list(dict.fromkeys(q["next_action"] for q in issues if q.get("next_action")))
+        if lead.get("next_action"):
+            actions.append(lead["next_action"])
+        if not actions:
+            actions = ["按所列缺口继续公开补证，未试联" if lead["status"] == "main" else "补齐主体、产品、地域和业务入口缺口后重新核验"]
+        source_levels = {"current_original": "当前原文", "cached_original": "缓存原文", "third_party_original": "第三方原文", "search_snippet": "搜索摘要，待原文核实", "failed_read": "读取失败"}
+        facts = ["[%s] %s（%s；读取 %s）：%s" % (s, sources[s]["title"], source_levels.get(sources[s].get("level"), "层级未记录"), sources[s].get("read_at", "未记录"), sources[s]["excerpt"]) for s in linked]
+        relations_text = ["%s／%s／%s：%s；%s；%s [%s]" % (r.get("country", "待核"), r.get("city", "待核"), r["market"], r.get("detail", "有据场内关系"), {"main": "该市场正式", "candidate": "该市场待核", "excluded": "该市场排除", "duplicate": "同主体重复记录已合并"}.get(r.get("status"), "位置已核"), labels.get(r.get("collection_segment"), "类别未单列"), " ".join(r.get("source_ids", []))) for r in relations]
+        row = ["、".join(x for x in countries if x) or "待核", "、".join(x for x in cities if x) or "待核", "；".join(markets) or "待市场定位", kind, "正式" if lead["status"] == "main" else "待核", lead["lead_id"], lead["name"], "、".join(matched_products(lead, task, sources) if lead["status"] == "main" else sorted({p["product"] for p in lead.get("product_evidence", []) if p["product"] in task.get("products", [])})) or "待核", "已核" if review["white_label_status"] == "verified" else "待核", "、".join(review["white_label_products"]) or "尚无足够证据", "\n".join(contact_display(c, lead.get("qualification_batch_id", batch_id)) for c in lead.get("contacts", [])), "\n".join("[%s] %s" % (s, sources[s]["url"]) for s in linked), "\n".join(facts) or lead.get("reason", "事实待核"), "\n".join(gaps), "\n".join(actions), lead.get("address", "未知"), lead.get("buyer_type", "待核"), lead.get("priority") or "未评级", lead.get("manual_notes", ""), "\n".join(relations_text) or "尚无已核市场关系", boundary]
+        rows.append(row)
+    rows.sort(key=lambda row: tuple(normalized(row[i]) for i in (0, 1, 2, 3)) + (0 if row[4] == "正式" else 1, row[5]))
+    if not rows:
+        summary = batch.get("research_summary") or {}
+        context = batch.get("market_context") or summary.get("market_sequence", {}).get("active_market") or {}
+        row = [""] * len(header)
+        row[0], row[1], row[2] = context.get("country") or "、".join(task.get("countries", [])), context.get("city", ""), context.get("market", "待市场定位")
+        row[4], row[6] = "说明（非客户）", "本轮暂无正式或待核客户记录"
+        row[13] = "；".join(batch.get("limitations", [])) or "当前已保存记录为空，不表示该地区没有客户或已采集充分"
+        row[14] = summary.get("next_action") or "继续当前市场已登记的未读入口；预算耗尽时接续原任务"
+        row[-1] = boundary
+        rows.append(row)
+    write_xlsx(output, [("客户总表", [header] + rows, widths)])
+    return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": counts, "sheets": 1, "output_layout": "single_sheet", "customer_rows": len(selected), "master_modified": False}
+
+
 def export_view(master, batch, batch_id, output):
+    if batch["task"].get("output_layout") == "single_sheet":
+        return export_single_sheet(master, batch, batch_id, output)
     leads = batch["lead_snapshots"]
     legacy = batch.get("schema_version", 1) < 2
     independent_policy = not legacy and brand_policy(batch["task"]) == "independent_product"

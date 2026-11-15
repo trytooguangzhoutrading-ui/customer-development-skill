@@ -60,7 +60,7 @@ UPDATE只接受`state:"complete"`，另须detail、boundary、cursor、`director
 
 这个字段只证明所声明的目录边界已处理，不能自动证明全市场商户已列全。Codex必须核目录／分区边界确实足以支持用户要求的当前市场完整采集，才登记完成；若只读完有限搜索结果或目录不完整，保留未完成和真实限制，不用命令通过代替全场证据。
 
-当前市场完成后，本批停止新增商户采集，保存其独立Excel；finish可用market_complete，下一次workflow continue才推进到next_market_id。当前市场未完成时，预算结束、受阻、暂缓或数量达标均继续保留该市场。同城可沿用有效预研，跨城preflight_city_id不符时须先更新渠道与联系生态。已列队列完成但目录未证完整时仍需扩展目录，不宣称全城／全国完成。
+当前市场完成后，本批停止新增商户采集，将当前结果合入统一客户总表；finish可用market_complete，下一次workflow continue才推进到next_market_id。当前市场未完成时，预算结束、受阻、暂缓或数量达标均继续保留该市场。同城可沿用有效预研，跨城preflight_city_id不符时须先更新渠道与联系生态。已列队列完成但目录未证完整时仍需扩展目录，不宣称全城／全国完成。
 
 ## 逐次保存真实研究
 
@@ -87,7 +87,7 @@ status的research_effort按overall、by_route、by_work_kind和by_subject显示�
 
 ## 目标与结束
 
-mode=new/continue默认以new_qualified为目标，即本轮前主库不存在、当前通过准入且规范去重后的独立主体数。independent_product下品牌店分表计数，不充独立商户目标。enrich默认以updated为目标；qualified可用于用户明确要求本批全部合格条数的任务。新增联系方式、既有候选晋级或重复别名不冒充新增合格主体。每条任务的target_count、target_metric和work_budget在开始前落盘；已开始后要改变政策应另建任务，不偷改计时。
+mode=new/continue默认以new_qualified为目标，即本轮前主库不存在、当前通过准入且规范去重后的独立主体数。independent_product下品牌店分类计数，不充独立商户目标。enrich默认以updated为目标；qualified可用于用户明确要求本批全部合格条数的任务。新增联系方式、既有候选晋级或重复别名不冒充新增合格主体。每条任务的target_count、target_metric和work_budget在开始前落盘；已开始后要改变政策应另建任务，不偷改计时。
 
 新发现默认completion_policy=coverage，target_count=20是阶段观察目标，达到20不自动结束市场或城市。员工显式数量可使用target_or_coverage，达到本次目标可交付。work_budget默认max_attempts=80、max_minutes=45，是每轮资源上限，可被需求覆盖。预算到达仍有路线未完成时必须写partial、当前市场及接续位置，不自动跳下一市场。地图未查类别、受阻路线、未读入口不能被batch_complete/paths_exhausted掩盖。指定名单补证mode=enrich默认provided_leads，不强迫另建全城渠道地图。
 

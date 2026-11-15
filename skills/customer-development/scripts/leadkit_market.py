@@ -68,6 +68,59 @@ def _historical_entities(timeline):
     return entities
 
 
+def _entity_reviews(timeline, identities, sources):
+    """Replay entity-wide decisions, including those saved under other scopes."""
+    reviews, identity_sources = {}, {}
+    for bid, batch in timeline:
+        for lead in batch.get("lead_snapshots", []):
+            key = core.canonical_entity(lead["lead_id"], identities)
+            qualification = lead.get("qualifications", {}).get(batch.get("scope_id"), {})
+            # Merged snapshots may inherit an old resolution. Only the current
+            # qualification's explicit input can reverse an exclusion.
+            facts = qualification.get("evidence_snapshot") if qualification.get("batch_id") == bid else lead
+            if not facts:
+                facts = {k: lead[k] for k in ("status", "exclusion") if k in lead}
+            novel_identity = set(facts.get("identity_source_ids", [])) - identity_sources.get(key, set())
+            identity_sources.setdefault(key, set()).update(facts.get("identity_source_ids", []))
+            exclusion = facts.get("exclusion", {})
+            if facts.get("status") == "excluded" and exclusion.get("code") in {"closed", "brand_owner"}:
+                reviews[key] = {"excluded": True, "exclusion": copy.deepcopy(exclusion), "batch_id": bid,
+                                "source_ids": set(exclusion.get("source_ids", []))}
+                continue
+            prior = reviews.get(key)
+            if not prior or not prior["excluded"] or facts.get("status") == "excluded":
+                continue
+            resolution = facts.get("exclusion_resolution", {})
+            novel = set(resolution.get("source_ids", [])) - set(prior["exclusion"].get("source_ids", []))
+            supported = bool(resolution.get("detail")) and any(sources.get(s, {}).get("level") in core.STRONG for s in novel)
+            if prior["exclusion"]["code"] == "closed":
+                supported = supported and facts.get("entity_status") == "active" and any(
+                    sources.get(s, {}).get("level") in core.STRONG for s in novel_identity)
+            else:
+                supported = supported and facts.get("brand_profile") in ({"independent", "white_label", "mixed"} | core.BRAND_STORES)
+            if supported:
+                prior.update(excluded=False, restored_at=(_commit_time(batch), bid))
+                prior["source_ids"].update(resolution.get("source_ids", []))
+    return reviews
+
+
+def apply_entity_review(lead, review, batches):
+    """Apply a global decision without importing another scope's product facts."""
+    if not review:
+        return
+    lead["export_source_ids"] = sorted(set(lead.get("export_source_ids", [])) | review["source_ids"])
+    if review["excluded"]:
+        lead.update(status="excluded", exclusion=copy.deepcopy(review["exclusion"]), qualified_products=[], priority="")
+        return
+    bid = lead.get("qualification_batch_id")
+    qualification_order = (_commit_time(batches[bid]), bid) if bid in batches else None
+    if qualification_order is None or qualification_order < review["restored_at"]:
+        if lead.get("status") in {"main", "candidate"} or lead.get("exclusion", {}).get("code") in {"closed", "brand_owner"}:
+            lead.update(status="candidate", qualified_products=[], priority="")
+            lead.pop("exclusion", None)
+            lead["unknowns"] = core.append_unique(lead.get("unknowns", []), ["全主体排除已有明确恢复证据；本范围资格早于恢复，须重新核验，不能借其他范围事实自动恢复正式资格"])
+
+
 def directory_tables(directory, grouped=None, active_market_id=None):
     """Reader-facing overview; aggregate canonical IDs, never sum market counts."""
     countries, cities, markets = directory_maps(directory)
@@ -128,6 +181,7 @@ def bundle_views(master, batch_id):
                        if batch.get("committed_at") and _commit_time(batch) <= cutoff],
                       key=lambda pair: (_commit_time(pair[1]), pair[0]))
     identities = _historical_entities(timeline)
+    reviews = _entity_reviews(timeline, identities, master["sources"])
     relevant = [(bid, b) for bid, b in timeline
                 if b.get("scope_id") == reference["scope_id"]
                 and b.get("task", {}).get("collection_strategy") == "market_sequence"]
@@ -169,6 +223,10 @@ def bundle_views(master, batch_id):
                 unassigned.pop(key, None)
             elif not any(key in records for records in per_market.values()):
                 remember(unassigned, key, lead)
+
+    for records in list(per_market.values()) + [unassigned]:
+        for key, lead in records.items():
+            apply_entity_review(lead, reviews.get(key), master["batches"])
 
     def view(records, context):
         value = copy.deepcopy(reference)
@@ -212,6 +270,78 @@ def _component(identifier, name):
     return identifier + "-" + (safe or "未命名")
 
 
+def single_view(master, batch_id):
+    """One canonical entity per row, retaining separately evidenced memberships."""
+    directory, views, unassigned, _ = bundle_views(master, batch_id)
+    reference = master["batches"][batch_id]
+    countries, cities, markets = directory_maps(directory)
+    timeline = sorted([(bid, b) for bid, b in master["batches"].items() if b.get("committed_at") and _commit_time(b) <= _commit_time(reference)], key=lambda pair: (_commit_time(pair[1]), pair[0]))
+    identities = _historical_entities(timeline)
+    alias_evidence, alias_locations = {}, {}
+    for bid, batch in timeline:
+        for lead in batch.get("lead_snapshots", []):
+            if not lead.get("canonical_id"):
+                continue
+            canonical = core.canonical_entity(lead["lead_id"], identities)
+            alias_evidence.setdefault(canonical, set()).update(lead.get("relationship_evidence", {}).get("source_ids", []) + lead.get("exclusion", {}).get("source_ids", []))
+            assignment = lead.get("market_assignment") or {}
+            mid = assignment.get("market_id")
+            if batch.get("scope_id") == reference["scope_id"] and mid in markets and assignment.get("relation") == "within" and any(master["sources"].get(s, {}).get("level") in core.STRONG for s in assignment.get("source_ids", [])):
+                city = cities[markets[mid]["city_id"]]
+                relation = {"country": countries[city["country_id"]]["name"], "city": city["name"], "market": markets[mid]["name"], "market_id": mid, "relation": "within", "source_ids": copy.deepcopy(assignment["source_ids"]), "detail": assignment.get("detail", "已归并别名的场内位置证据"), "status": "duplicate", "qualification_batch_id": bid}
+                alias_locations.setdefault(canonical, {})[mid] = relation
+    observations = {}
+    for view in list(views.values()) + [unassigned]:
+        context = view.get("market_context", {})
+        for lead in view["lead_snapshots"]:
+            observations.setdefault(lead["lead_id"], []).append((lead, context))
+    merged = []
+    for lid, records in observations.items():
+        def rank(record):
+            lead = record[0]
+            source_batch = master["batches"].get(lead.get("qualification_batch_id"), reference)
+            return (lead.get("status") == "main", _commit_time(source_batch), lead.get("recorded_lead_id") == lid)
+        representative = copy.deepcopy(max(records, key=rank)[0])
+        latest = max(records, key=lambda record: _commit_time(master["batches"].get(record[0].get("qualification_batch_id"), reference)))[0]
+        if latest.get("status") == "excluded" and latest.get("exclusion", {}).get("code") in {"brand_owner", "closed"}:
+            representative = copy.deepcopy(latest)
+        relations, evidence = [], set()
+        segments = set()
+        for lead, context in sorted(records, key=rank):
+            evidence.update(core.lead_source_ids(lead))
+            evidence.update(lead.get("export_source_ids", []))
+            if lead.get("status") == "main" or representative.get("status") != "main":
+                segments.add(core.collection_segment(lead, reference["task"]))
+            assignment = lead.get("market_assignment") or {}
+            if assignment.get("relation") == "within" and context.get("market_id") == assignment.get("market_id") and any(master["sources"].get(s, {}).get("level") in core.STRONG for s in assignment.get("source_ids", [])):
+                relation = {key: context[key] for key in ("country", "city", "market", "market_id") if key in context}
+                relation.update(relation="within", source_ids=copy.deepcopy(assignment["source_ids"]), detail=assignment.get("detail", "有据场内位置"), status=lead["status"], collection_segment=core.collection_segment(lead, reference["task"]), qualification_batch_id=lead.get("qualification_batch_id"))
+                relations.append(relation)
+        evidence.update(alias_evidence.get(lid, set()))
+        for mid, relation in alias_locations.get(lid, {}).items():
+            existing = next((r for r in relations if r.get("market_id") == mid), None)
+            if existing:
+                existing["source_ids"] = core.append_unique(existing["source_ids"], relation["source_ids"])
+            else:
+                relations.append(relation)
+        representative.update(market_relations=relations, collection_segments=sorted(segments), export_source_ids=sorted(evidence))
+        merged.append(representative)
+    result = copy.deepcopy(reference)
+    result["task"]["output_layout"] = "single_sheet"
+    result.update(view="market_delivery", lead_snapshots=merged, counts=core.result_counts(merged, result["task"]), source_ids=[], queue=[], coverage=[], duplicate_hints=[])
+    result["limitations"] = core.append_unique(reference.get("limitations", []), ["同一主体合为一行，保留截止批次有据的全部市场关系；正式／待核取原记录，不通过拼接缺失事实晋级。", "品牌店仍与独立商户分类，未知市场保留待定位；各市场研究顺序与断点不因输出合表改变。"])
+    sequence = reference.get("research_summary", {}).get("market_sequence", {})
+    active_id = sequence.get("batch_market_id") or sequence.get("active_market_id")
+    if active_id in views:
+        result["market_context"] = copy.deepcopy(views[active_id]["market_context"])
+    return result
+
+
+def export_single(root, batch_id, output):
+    master, _ = core.load_master(root)
+    return core.export_single_sheet(master, single_view(master, batch_id), batch_id, output)
+
+
 def export_bundle(root, batch_id, output_dir):
     master, _ = core.load_master(root)
     directory, views, unassigned, grouped = bundle_views(master, batch_id)
@@ -223,6 +353,7 @@ def export_bundle(root, batch_id, output_dir):
     core.write_xlsx(overview, directory_tables(directory, grouped))
     files = [str(overview)]
     for mid, view in views.items():
+        view["task"]["output_layout"] = "legacy"
         c = view["market_context"]
         folder = destination / _component(c["country_id"], c["country"]) / _component(c["city_id"], c["city"])
         folder.mkdir(parents=True, exist_ok=True)
@@ -230,6 +361,7 @@ def export_bundle(root, batch_id, output_dir):
         core.export_view(master, view, batch_id, output)
         files.append(str(output))
     if unassigned["lead_snapshots"]:
+        unassigned["task"]["output_layout"] = "legacy"
         output = destination / "待市场定位.xlsx"
         core.export_view(master, unassigned, batch_id, output)
         files.append(str(output))
@@ -243,14 +375,16 @@ def main():
     export = sub.add_parser("export")
     export.add_argument("--workspace", required=True)
     export.add_argument("--batch-id", required=True)
-    export.add_argument("--output-dir", required=True)
+    destination = export.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--output", help="One Excel file with one customer sheet")
+    destination.add_argument("--output-dir", help="Explicit compatibility export: separate legacy market workbooks")
     overview = sub.add_parser("overview")
     overview.add_argument("--plan", required=True, help="JSON directory or object containing market_directory; no customer master required")
     overview.add_argument("--output", required=True)
     args = parser.parse_args()
     try:
         if args.command == "export":
-            result = export_bundle(core.workspace_path(args.workspace), args.batch_id, args.output_dir)
+            result = export_single(core.workspace_path(args.workspace), args.batch_id, args.output) if args.output else export_bundle(core.workspace_path(args.workspace), args.batch_id, args.output_dir)
         else:
             data = core.read_json(args.plan)
             target = Path(args.output).expanduser().absolute()

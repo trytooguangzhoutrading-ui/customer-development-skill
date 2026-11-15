@@ -369,7 +369,7 @@ def _plan_status(log):
         result.update(market_sequence=sequence, preflight_ready=ready, city_preflight_ready=city_ready,
                       scope_completion="complete" if done else "partial", collection_complete=done,
                       next_route_id=current_routes[0]["route_id"] if current_routes and ready and not sequence["active_market_complete"] else None,
-                      next_action="当前市场已完成；保存该市场独立交付，下一批才进入下一市场" if sequence["active_market_complete"] else
+                      next_action="当前市场已完成；将该市场结果合入客户总表，下一批才进入下一市场" if sequence["active_market_complete"] else
                                   "先完成当前城市的渠道与联系预研" if not ready else "继续当前市场的未读商户；预算结束仍接续本市场")
     return result
 
