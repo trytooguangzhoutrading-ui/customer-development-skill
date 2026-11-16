@@ -324,6 +324,38 @@ class LeadkitTests(unittest.TestCase):
         self.assertIn("后台排除 1", rows[1][-1])
         self.assertTrue(rows[1][14])
 
+    def test_single_sheet_channel_reserve_stays_candidate_and_requires_readable_channel_basis(self):
+        packet = self.independent_packet()
+        packet["task"].update(output_layout="single_sheet", allow_channel_candidates=True)
+        reserve = copy.deepcopy(packet["leads"][0])
+        reserve.update(lead_id="RESERVE", name="虚构手机配件批发渠道", status="candidate",
+                       product_evidence=[], channel_fit="可读资料表明销售成品手机配件，主营穿戴待核",
+                       channel_source_ids=["SRC-001"])
+        reserve["contacts"][0]["value"] = "+001111111111"
+        pending = copy.deepcopy(reserve)
+        pending.update(lead_id="PENDING", name="虚构目录待核商户", channel_fit="", channel_source_ids=[])
+        pending["contacts"][0]["value"] = "+002222222222"
+        packet["leads"].extend([reserve, pending])
+        self.commit(packet)
+        before = (self.root / "execution/master.json").read_bytes()
+        output = self.root / "outputs/pool.xlsx"
+        result = kit.export_batch(self.root, "new-policy", output)
+        _, rows = single_sheet_rows(output)
+        values = {row[5]: dict(zip(rows[0], row)) for row in rows[1:]}
+        self.assertEqual(values["RESERVE"]["状态"], "渠道储备")
+        self.assertEqual(values["PENDING"]["状态"], "待核")
+        self.assertEqual(result["delivery_counts"], {"正式": 1, "渠道储备": 1, "待核": 1})
+        self.assertEqual(result["counts"]["main"], 1)
+        self.assertEqual(result["counts"]["candidate"], 2)
+        self.assertEqual(before, (self.root / "execution/master.json").read_bytes())
+        weak = {"SRC-001": {"level": "search_snippet"}}
+        self.assertEqual(kit.customer_pool_label(reserve, weak), "待核")
+        self.assertEqual(kit.customer_pool_label(reserve, {}), "待核")
+        reserve["status"] = "main"
+        packet["leads"] = [reserve]
+        with self.assertRaisesRegex(kit.LeadkitError, "requested product"):
+            kit.validate_packet(packet, kit.load_master(self.root)[0])
+
     def test_output_layout_is_not_a_qualification_scope_or_historical_rewrite(self):
         packet = self.independent_packet()
         original_scope = kit.scope_key(packet["task"])

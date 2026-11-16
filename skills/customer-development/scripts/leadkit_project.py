@@ -155,6 +155,115 @@ def guard_json_workspace(root):
     return bound_root, binding
 
 
+def _excel_configuration_review(config, task, binding):
+    """Explain saved scope versus current defaults without migrating Excel tasks."""
+    defaults = config.get("task_defaults", {})
+    core.require(isinstance(defaults, dict), "config.task_defaults must be an object")
+    saved = task.get("scope", task)
+    core.require(isinstance(saved, dict), "Excel task.scope must be an object")
+    current = {"products": defaults.get("products", config.get("products", core.PRIMARY_PRODUCTS)),
+               "supplementary_products": defaults.get("supplementary_products", [] if "products" in defaults else config.get("supplementary_products", []))}
+    for key, value in current.items():
+        core.string_list(value, "current defaults." + key)
+    if "supplementary_products" not in defaults:
+        current["supplementary_products"] = [x for x in current["supplementary_products"] if x not in current["products"]]
+    differences, unknown = {}, []
+    for key, value in current.items():
+        core.string_list(value, "current defaults." + key)
+        previous = saved.get(key)
+        if previous is None:
+            unknown.append(key)
+        else:
+            core.string_list(previous, "saved task." + key)
+            if set(previous) != set(value):
+                differences[key] = {"task": previous, "current_defaults": value,
+                                    "only_in_task": sorted(set(previous) - set(value)),
+                                    "only_in_defaults": sorted(set(value) - set(previous))}
+    context = task.get("current_context") or task.get("project_context") or {}
+    versions = {"runtime": core.VERSION, "binding": binding.get("rules_version"),
+                "config_declared": config.get("rules_version"),
+                "task": context.get("rules_version", task.get("rules_version"))}
+    version_differences = {key: value for key, value in versions.items() if value is not None and value != core.VERSION}
+    profile = defaults.get("customer_profile", {})
+    saved_profile = task.get("customer_profile", {})
+    core.require(isinstance(profile, dict) and isinstance(saved_profile, dict), "Customer profile must be an object")
+    brand = profile.get("brand_policy", config.get("brand_policy", "independent_product"))
+    current_policy = {"brand_policy": brand,
+                      "collect_brand_stores": profile.get("collect_brand_stores", config.get("collect_brand_stores", brand == "independent_product")),
+                      "collection_strategy": defaults.get("collection_strategy", config.get("collection_strategy", "market_sequence"))}
+    saved_policy = dict(saved_profile, collection_strategy=task.get("collection_strategy"))
+    policy_differences = {key: {"task": saved_policy[key], "current_defaults": value} for key, value in current_policy.items()
+                          if saved_policy.get(key) is not None and saved_policy[key] != value}
+    return {"task_scope": copy.deepcopy(saved), "current_defaults": current, "differences": differences,
+            "product_scope_differs": bool(differences), "unknown_task_fields": unknown,
+            "policy_differences": policy_differences, "policy_scope_differs": bool(policy_differences),
+            "rules_versions": versions, "versions_differ_from_runtime": version_differences,
+            "scope_changed_automatically": False, "review_required": bool(differences or policy_differences or unknown or version_differences),
+            "interpretation": "专项任务可与公司默认不同；缺少旧字段或版本变化不单独证明产品范围变化。继续沿用已保存范围，明确调整时另建任务，历史记录不改写。"}
+
+
+def _excel_task_context(root, binding, config):
+    """Read the existing Excel index and logs; never create another task or master."""
+    index_file = _file(root, "execution/excel-task-index.json", "Excel task index", required=False)
+    result = {"backend": "xlsx", "index": index_file, "active_task_id": None,
+              "task_found": False, "resume_ready": False, "selection_required": False,
+              "next_action": "读取已有Excel任务索引和实际研究记录；无索引时定位已有研究，不初始化JSON主库。"}
+    if not index_file["exists"]:
+        return result
+    index = core.read_json(index_file["resolved_path"])
+    core.require(index.get("schema_version") == 1 and index.get("backend", "xlsx") == "xlsx" and isinstance(index.get("tasks"), dict), "Invalid Excel task index")
+    review = copy.deepcopy(index.get("continuation_review") or {})
+    core.require(isinstance(review, dict), "Excel continuation_review must be an object")
+    if review.get("path"):
+        reference = _file(root, review["path"], "continuation review", required=False)
+        if reference["exists"]:
+            actual = core.read_json(reference["resolved_path"])
+            core.require(isinstance(actual, dict), "Continuation review must be an object")
+            review.update({key: actual[key] for key in ("state", "rules_version", "scope_changed", "active_market_id", "next_action") if key in actual})
+        review["reference"] = reference
+    result["continuation_review"] = review
+    tasks = index["tasks"]
+    selected = index.get("active_task_id")
+    if selected is None and len(tasks) == 1:
+        selected = next(iter(tasks))
+        result["selection_basis"] = "only_indexed_task_without_writing_pointer"
+    elif selected is None or selected not in tasks:
+        result.update(selection_required=bool(tasks), candidates=sorted(tasks),
+                      next_action="活动Excel任务指针缺失或失效；按任务内容选择，不按文件修改时间猜测。")
+        if review.get("next_action"):
+            result["next_action"] = review["next_action"] + "；仍须明确活动任务。"
+        return result
+    entry = tasks[selected]
+    core.require(isinstance(entry, dict), "Excel task index entry must be an object")
+    task_file = _file(root, entry.get("task_path"), "Excel task_path", required=False)
+    research_log = _file(root, entry.get("research_log_path"), "Excel research_log_path", required=False)
+    result.update(active_task_id=selected, task_file=task_file, research_log=research_log,
+                  task_state=entry.get("state"), task_found=task_file["exists"],
+                  resume_ready=task_file["exists"] and research_log["exists"])
+    if not result["resume_ready"]:
+        result["next_action"] = "恢复活动任务缺失的task.json或research-log.json；保留原指针和主库，不建立替代空库。"
+        return result
+    task = core.read_json(task_file["resolved_path"])
+    log = core.read_json(research_log["resolved_path"])
+    core.require(isinstance(task, dict) and task.get("task_id") == selected, "Excel task ID does not match its active index entry")
+    core.require(isinstance(log, dict) and log.get("task_id") == selected, "Excel research log ID does not match its active task")
+    for declared_master in (entry.get("master_path"), (task.get("master") or {}).get("path")):
+        if declared_master:
+            core.require(_path(root, declared_master, "Excel task master") == _path(root, binding["master"]["path"], "bound master"), "Active Excel task belongs to a different master")
+    configuration = (_excel_configuration_review(config, task, binding) if config is not None else
+                     {"available": False, "review_required": True, "product_scope_differs": None, "scope_changed_automatically": False})
+    result.update(task_state=task.get("state", entry.get("state")),
+                  active_market_id=task.get("active_market_id", entry.get("active_market_id")),
+                  saved_next_action=task.get("next_action", entry.get("next_action")),
+                  configuration_review=configuration,
+                  next_action="读取同一任务与研究日志，沿用真实未读入口、已用预算及历史来源；Excel分支不调用JSON初始化。")
+    if configuration["review_required"]:
+        result["next_action"] = "先核对当前默认与已保存任务的差异；明确继续仍保留原范围、预算和研究记录，采用纠正后的范围时另建接续任务。"
+    if review:
+        result["next_action"] = review.get("next_action") or "先读取当前接续纠正记录，再决定如何接续；旧任务下一步仅供历史参考。"
+    return result
+
+
 def inspect(start):
     root, binding = locate(start)
     if binding is None:
@@ -164,7 +273,7 @@ def inspect(start):
     rules = _file(root, binding["rules_path"], "rules_path", required=False)
     additional = [dict(item, **{k: v for k, v in _file(root, item["path"], "additional_source.path", external=True, required=False).items() if k != "path"}) for item in binding.get("additional_sources", [])]
     missing = [x["resolved_path"] for x in [master, config, rules] + additional if not x["exists"]]
-    return {"bound": True, "project_root": str(root), "binding_path": str(root / BINDING), "project_id": binding["project_id"],
+    result = {"bound": True, "project_root": str(root), "binding_path": str(root / BINDING), "project_id": binding["project_id"],
             "master": dict(master, kind=binding["master"]["kind"]), "workspace": str(Path(master["resolved_path"]).parent.parent) if binding["master"]["kind"] == "json" else None,
             "company_config": config, "active_rules": dict(rules, version=binding["rules_version"]), "additional_sources": additional,
             "missing_paths": missing, "ready": not missing,
@@ -172,6 +281,10 @@ def inspect(start):
             "rules_changed_since_binding": rules["sha256"] != binding.get("rules_sha256"),
             "net_new_verified": False, "history_review_required": bool(additional),
             "next_action": "Read the bound master, effective company configuration and rules; compare all additional sources before claiming company-wide net-new customers. Binding is not data synchronization."}
+    if binding["master"]["kind"] == "xlsx":
+        result["task_context"] = _excel_task_context(root, binding, core.read_json(config["resolved_path"]) if config["exists"] else None)
+        result["next_action"] = result["task_context"]["next_action"]
+    return result
 
 
 def active_context(root):

@@ -266,6 +266,104 @@ class ResearchTests(unittest.TestCase):
         with self.assertRaisesRegex(kit.LeadkitError, "immutable"):
             research.record_attempt(self.root, packet["batch_id"], attempt)
 
+    def test_page_request_identity_ignores_purpose_channel_and_unused_fields(self):
+        packet = self.packet()
+        entry = self.entry(packet)
+        research.register_channel(self.root, self.channel("other_assignment"))
+        variants = [{"purpose": "channel_research"}, {"query": "unused page metadata"},
+                    {"input_reference": {"file": "irrelevant.xlsx"}}, {"cursor": ""},
+                    {"cursor": "   "}, {"channel_id": "other_assignment"}]
+        for number, changes in enumerate(variants):
+            with self.subTest(changes=changes), self.assertRaisesRegex(kit.LeadkitError, "reuse its stable entry_id"):
+                research.plan_entry(self.root, packet["batch_id"], dict(entry, entry_id="alias-%d" % number, **changes))
+        self.assertEqual(len(self.log()["entries"]), 1)
+        # A real different observed page boundary remains a separate operation.
+        self.assertTrue(research.plan_entry(self.root, packet["batch_id"], dict(entry, entry_id="page-second-part", cursor="lines=200-400"))["executable"])
+
+    def test_query_request_identity_preserves_provider_and_actual_cursor(self):
+        packet = self.packet()
+        research.register_channel(self.root, self.channel())
+        entry = {"entry_id": "query-1", "channel_id": "synthetic_directory", "kind": "query", "query": "Synthetic exact merchant query", "products": ["智能眼镜"], "next_action": "Run the synthetic query"}
+        research.plan_entry(self.root, packet["batch_id"], entry)
+        for number, changes in enumerate([{"purpose": "route_reconnaissance"}, {"url": "https://example.invalid/unused"}, {"cursor": ""}]):
+            with self.subTest(changes=changes), self.assertRaisesRegex(kit.LeadkitError, "reuse its stable entry_id"):
+                research.plan_entry(self.root, packet["batch_id"], dict(entry, entry_id="alias-query-%d" % number, **changes))
+        research.register_channel(self.root, self.channel("different_search_provider"))
+        self.assertTrue(research.plan_entry(self.root, packet["batch_id"], dict(entry, entry_id="other-engine", channel_id="different_search_provider"))["executable"])
+        self.assertTrue(research.plan_entry(self.root, packet["batch_id"], dict(entry, entry_id="next-page", cursor="page=2"))["executable"])
+        self.assertEqual(len(self.log()["entries"]), 3)
+
+    def test_same_request_legitimate_reread_uses_original_id_and_changed_condition(self):
+        packet = self.packet()
+        entry = self.entry(packet)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, state="blocked"))
+        condition = "Synthetic observation: the public endpoint now returns readable content"
+        with self.assertRaisesRegex(kit.LeadkitError, "reuse its stable entry_id"):
+            research.plan_entry(self.root, packet["batch_id"], dict(entry, entry_id="alias", purpose="channel_research", retry_condition=condition))
+        self.assertTrue(research.plan_entry(self.root, packet["batch_id"], dict(entry, retry_condition=condition))["executable"])
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="reread", retry_condition=condition))
+        self.assertEqual(research.status(self.root, packet["batch_id"])["attempts"], 2)
+        with self.assertRaisesRegex(kit.LeadkitError, "not changed"):
+            research.plan_entry(self.root, packet["batch_id"], dict(entry, retry_condition=condition))
+
+    def test_legacy_request_history_resolves_original_without_rewriting_it(self):
+        packet = self.packet()
+        entry = self.entry(packet)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet))
+        research.finish(self.root, packet["batch_id"], "batch_complete", "Synthetic historical read")
+        fixtures.LeadkitTests.commit(self, packet)
+        original_path = self.root / "research/round-1/research-log.json"
+        original_bytes = original_path.read_bytes()
+        packet = self.packet("round-2", sid="SRC-002")
+        research.carry_forward(self.root, "round-1", "round-2")
+        log = self.log("round-2")
+        for item in log["read_history"]:
+            item.pop("request_identity", None)  # Actual pre-fix history shape.
+        kit.safe_write(self.root / "research/round-2/research-log.json", log)
+        research.register_channel(self.root, self.channel("different_page_assignment"))
+        alias = dict(entry, entry_id="alias-old-page", channel_id="different_page_assignment", purpose="channel_research", query="unused", cursor="")
+        with self.assertRaisesRegex(kit.LeadkitError, "retry_condition"):
+            research.plan_entry(self.root, "round-2", alias)
+        # A real new boundary must remain available despite identical URL.
+        research.plan_entry(self.root, "round-2", dict(alias, entry_id="unread-part", cursor="lines=100-200"))
+        condition = "Synthetic newly published product content observed"
+        research.plan_entry(self.root, "round-2", dict(alias, retry_condition=condition))
+        research.record_attempt(self.root, "round-2", self.attempt(packet, eid="alias-old-page", retry_condition=condition))
+        self.assertEqual(original_path.read_bytes(), original_bytes)
+        research.finish(self.root, "round-2", "batch_complete", "Synthetic legitimate reread")
+        fixtures.LeadkitTests.commit(self, packet)
+        packet = self.packet("round-3", sid="SRC-003")
+        research.carry_forward(self.root, "round-2", "round-3")
+        # Both legacy and new request keys preserve the used retry condition.
+        with self.assertRaisesRegex(kit.LeadkitError, "not changed"):
+            research.plan_entry(self.root, "round-3", dict(entry, entry_id="third-name", retry_condition=condition))
+
+    def test_legacy_request_history_missing_origin_is_not_silently_bypassed(self):
+        packet = self.packet()
+        self.entry(packet)
+        log = self.log()
+        log["read_history"] = [{"entry_identity": "unrecoverable-old-hash", "batch_id": "missing-old-round", "entry_id": "old-entry", "attempt_conditions": [""]}]
+        kit.safe_write(self.root / "research/round-1/research-log.json", log)
+        with self.assertRaisesRegex(kit.LeadkitError, "Restore the original research log"):
+            self.entry(packet, eid="new-entry")
+        self.assertEqual(self.log(), log)
+
+    def test_existing_legacy_alias_cannot_discard_another_entry_retry_history(self):
+        packet = self.packet()
+        entry = self.entry(packet)
+        log = self.log()
+        log["entries"]["old-alias"] = dict(log["entries"]["page-1"], entry_id="old-alias", purpose="channel_research")
+        kit.safe_write(self.root / "research/round-1/research-log.json", log)
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, state="failed"))
+        alias = dict(entry, entry_id="old-alias", purpose="channel_research")
+        with self.assertRaisesRegex(kit.LeadkitError, "retry_condition"):
+            research.plan_entry(self.root, packet["batch_id"], alias)
+        condition = "Synthetic restored access observed for the previously shared endpoint"
+        research.plan_entry(self.root, packet["batch_id"], dict(alias, retry_condition=condition))
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="restored", eid="old-alias", retry_condition=condition))
+        self.assertEqual(research.status(self.root, packet["batch_id"])["attempts"], 2)
+        self.assertEqual(len(self.log()["entries"]), 2)  # Historical aliases remain intact.
+
     def test_failed_read_cannot_count_as_read(self):
         packet = self.packet()
         packet["sources"][0]["level"] = "failed_read"

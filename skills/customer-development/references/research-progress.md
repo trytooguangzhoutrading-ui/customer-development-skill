@@ -1,10 +1,10 @@
 # 研究进度、渠道可用性与停止条件
 
-这些记录由Codex在后台维护，员工只需输入业务需求。脚本不联网；可用性及证据必须来自本机实际调用，不把工具名称存在或配置写入当作来源已经接通。
+这些记录由Codex在后台维护，员工只需输入业务需求。脚本不联网；可用性及证据必须来自本机实际调用，不把工具名称存在或配置写入当作来源已经接通。以下CLI适用于已绑定JSON主库；已有Excel按[project-context.md](project-context.md)读取现有活动任务与日志，复用相同事实标准，不初始化第二套主库。
 
 ## 首次环境与渠道
 
-先建snapshot，再登记实际观察。`leadkit_research.py record-environment --workspace <PROJECT> --input <JSON>`接收search、web_read、local_python三个键；每项为`{status,checked_at,detail}`。status为available/unavailable/untested，checked_at含时区；detail写实际工具结果或尚未测试的原因。不要先写“成功”再试工具。
+JSON新任务先建snapshot；继续任务先恢复原账本，再登记实际观察。`leadkit_research.py record-environment --workspace <PROJECT> --input <JSON>`接收search、web_read、local_python三个键；每项为`{status,checked_at,detail}`。status为available/unavailable/untested，checked_at含时区；detail写实际工具结果或尚未测试的原因。不要先写“成功”再试工具。
 
 `register-channel --workspace <PROJECT> --input <JSON>`接收：
 
@@ -93,11 +93,19 @@ python3 <SKILL_DIR>/scripts/leadkit_research.py market-progress --workspace <PRO
 
 每个实际查询或网页工具读取调用按一次尝试保存，包括同一页面的open(ref_id,lineno)续读、点击或重新抓取；一次工具请求中包含多个查询/页面时逐项计数。仅对已经返回的文本做本地截取不增加访问次数，也不增加客户数。页内续读在原URL上记录实际已见的行范围/段落位置为cursor，先登记相应entry，再执行读取；不能将多次open合成一次来减少预算。条数、页面数、目录总数与合格客户数分开。已读链接与未读入口保留；无新cursor的同一入口再次读取需记录实际改变的retry_condition，例如授权已恢复或新的可读版本。无变化的受阻路径不重试，改走当前市场已有可用来源，不能自动进入其他市场。历史来源沿用不伪装成新访问，也不回填虚构的尝试时间。
 
+### 请求复用与旧日志
+
+同一实际请求复用稳定entry_id。page按URL与真实cursor识别；query按稳定查询提供方channel_id、query与cursor识别；file按input_reference与cursor识别；link按已读parent_url与实际link_id识别。缺省、null及空白字符串cursor等价，不能靠空值写法另领一次。不同真实游标、页内读取范围或查询提供方可分别登记，不把合法续读混成重复。
+
+purpose、产品范围、分工channel名称及page上的无用query等元数据不能改变页面请求身份；query上的无用url也不能制造新查询。查询channel_id必须代表真实提供方，不能为重搜改名。近义词、相似查询和相近URL仍需结合已有命中人工判断是否值得再查，代码不做语义等价推断。
+
+跨批carry-forward保留原entry_identity，并附request_identity供新的重复判断；旧历史通过batch_id和entry_id只读回查原日志，不重写冻结文件。原日志缺失时恢复后再核历史，不编造身份或清空历史绕过。检查范围为当前账本和明确继承的历史，不宣称自动扫描全部其他任务；新任务另复用相关已知入口。旧日志若已存在同请求别名，其实际重试条件合并检查。重读仍须填写真实变化的retry_condition并保留回执；脚本只能检查声明及引用，不能证明网页或权限确已恢复。同市场并行由协调者共享已派发／已读入口，幂等返回不是多个执行者同时访问的许可。
+
 ## 研究投入和路线暂缓
 
 若执行者违反上述顺序，实际发生未登记访问，不补造事前登记，也不继续按较小账本放大预算。立即保存该次实际工具回执及真实起止时间，用`record-deviation --batch-id <ID> --input <JSON>`记入独立异常账本。JSON为`{deviation_id,kind:"unplanned_network",started_at,ended_at,detail,evidence:{path,sha256}}`；一个记录对应一次真实访问，path是工作区内单次原始回执文件的相对路径（禁止符号链接），sha256为原文件内容哈希。该命令不联网、不授予执行权限、不增加发现或合格归因；报告必须披露偏差，不能称该轮严格合规。实际预算包含正常attempts与deviations，status分别列ledger_attempts和unplanned_attempts；有偏差时protocol_conformant=false，无记录时为null，不自动证明执行合规。已提交批次不回写，下一批保留deviation_history但不把旧访问计为新轮尝试。仅恢复真实异常，不把普通资料缺口或程序校验错误伪造为网络访问。
 
-新商户动作的entry可带work_kind：discovery（发现新商户）、qualification（资格补证）、contact（联系补充）；subject_ids关联已在主库或草稿保存的对象。分类描述动作目的，不改变purpose、路线顺序或资格。新任务应按实际动作填写；旧记录缺失时显示unclassified，不回填推测分类。实际发现仍由attempt.discovered_lead_ids记录，只能引用真实已保存候选；目录总数不是该数组。
+先从实际商户入口保存相关具名候选，再围绕准入缺口持续补证；渠道储备的产品待核不阻塞其他候选发现，纯元件等目录观察不混入客户池。新商户动作的entry可带work_kind：discovery（发现新商户）、qualification（资格补证）、contact（联系补充）；subject_ids关联已在主库或草稿保存的对象。分类描述动作目的，不改变purpose、路线顺序或资格。新任务应按实际动作填写；旧记录缺失时显示unclassified，不回填推测分类。实际发现仍由attempt.discovered_lead_ids记录，只能引用真实已保存候选；目录总数不是该数组。
 
 status的research_effort按overall、by_route、by_work_kind和by_subject显示投入、读取结果及去重发现；allocation_review提示实际集中程度、未展开和已暂缓路线。数据用于Codex在目录边界、继续深挖同一主体或切换路线时审视：是否还有更有希望发现新主体或闭合缺口的真实入口。它不设固定转化率，不按分数自动判定客户，也不自动暂停或换路线。未归类的旧动作与没有归因的候选如实显示，不能把已有资料当新发现。
 

@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 PRIMARY_PRODUCTS = ["智能眼镜", "智能手表", "智能手表表带", "智能手环", "智能戒指"]
 SUPPLEMENTARY_PRODUCTS = ["蓝牙耳机", "蓝牙音响"]
 PRODUCTS = PRIMARY_PRODUCTS + SUPPLEMENTARY_PRODUCTS
@@ -1431,7 +1431,7 @@ def market_progress_note(batch):
     state = context.get("state", "complete" if sequence.get("active_market_complete") else "unknown")
     if state == "open" and active_id:
         state = "active"
-    labels = {"open": "未开始", "active": "采集中，未完成", "complete": "已完成登记边界", "blocked": "受阻未完成", "needs_research": "待预研，未完成", "deferred": "暂缓未完成", "unknown": "未记录，不视为完成"}
+    labels = {"open": "未开始", "active": "采集中，未完成", "complete": "已完成登记边界", "blocked": "受阻未完成", "needs_research": "待预研，未完成", "deferred": "暂缓未完成", "review_required": "需复核适配，未完成", "unknown": "未记录，不视为完成"}
     next_action = (context.get("progress") or {}).get("next_action") or context.get("next_action") or summary.get("next_action") or "未记录具体下一步，须从保存账本恢复"
     parts = ["当前市场：" + "／".join(x for x in (context.get("country"), context.get("city"), market_name) if x),
              "状态：" + labels.get(state, state), "覆盖边界：" + context.get("boundary", "未记录完整边界"), "下一步：" + next_action]
@@ -1440,6 +1440,16 @@ def market_progress_note(batch):
         if value:
             parts.append(label + "：" + ("、".join(value) if isinstance(value, list) else value))
     return "；".join(parts)
+
+
+def customer_pool_label(lead, sources):
+    """Separate evidenced channel reserves without promoting task qualification."""
+    if lead.get("status") == "main":
+        return "正式"
+    if (lead.get("status") == "candidate" and str(lead.get("channel_fit") or "").strip()
+            and any(sources.get(s, {}).get("level") in STRONG for s in lead.get("channel_source_ids", []))):
+        return "渠道储备"
+    return "待核"
 
 
 def export_single_sheet(master, batch, batch_id, output):
@@ -1457,9 +1467,11 @@ def export_single_sheet(master, batch, batch_id, output):
         if previous is None or previous["status"] != "main":
             selected[lead["lead_id"]] = lead
     counts = result_counts(list(selected.values()), task)
+    delivery_counts = {label: sum(customer_pool_label(lead, sources) == label for lead in selected.values())
+                       for label in ("正式", "渠道储备", "待核")}
     counts["excluded"] = batch.get("counts", {}).get("excluded", sum(x.get("status") == "excluded" for x in batch.get("lead_snapshots", [])))
     view_label = "当前有效资格" if batch.get("view") == "current" else "截至参考批次的市场合并结果" if batch.get("view") == "market_delivery" else "本批冻结结果"
-    boundary = "%s；批次 %s；正式 %d，待核 %d，后台排除 %d。正式表示满足研究条件，未确认采购意愿或联系可达；品牌店不充独立商户目标。" % (view_label, batch_id, counts["main"], counts["candidate"], counts["excluded"])
+    boundary = "%s；批次 %s；正式 %d，渠道储备 %d，待核 %d，后台排除 %d。储备尚缺目标产品等准入证据，不计正式；正式未确认采购意愿或联系可达，品牌店不充独立商户目标。" % (view_label, batch_id, delivery_counts["正式"], delivery_counts["渠道储备"], delivery_counts["待核"], counts["excluded"])
     progress_note = market_progress_note(batch)
     if progress_note:
         boundary += " " + progress_note + "。"
@@ -1493,7 +1505,7 @@ def export_single_sheet(master, batch, batch_id, output):
         source_levels = {"current_original": "当前原文", "cached_original": "缓存原文", "third_party_original": "第三方原文", "search_snippet": "搜索摘要，待原文核实", "failed_read": "读取失败"}
         facts = ["[%s] %s（%s；读取 %s）：%s" % (s, sources[s]["title"], source_levels.get(sources[s].get("level"), "层级未记录"), sources[s].get("read_at", "未记录"), sources[s]["excerpt"]) for s in linked]
         relations_text = ["%s／%s／%s：%s；%s；%s [%s]" % (r.get("country", "待核"), r.get("city", "待核"), r["market"], r.get("detail", "有据场内关系"), {"main": "该市场正式", "candidate": "该市场待核", "excluded": "该市场排除", "duplicate": "同主体重复记录已合并"}.get(r.get("status"), "位置已核"), labels.get(r.get("collection_segment"), "类别未单列"), " ".join(r.get("source_ids", []))) for r in relations]
-        row = ["、".join(x for x in countries if x) or "待核", "、".join(x for x in cities if x) or "待核", "；".join(markets) or "待市场定位", kind, "正式" if lead["status"] == "main" else "待核", lead["lead_id"], lead["name"], "、".join(matched_products(lead, task, sources) if lead["status"] == "main" else sorted({p["product"] for p in lead.get("product_evidence", []) if p["product"] in task.get("products", [])})) or "待核", "已核" if review["white_label_status"] == "verified" else "待核", "、".join(review["white_label_products"]) or "尚无足够证据", "\n".join(contact_display(c, lead.get("qualification_batch_id", batch_id)) for c in lead.get("contacts", [])), "\n".join("[%s] %s" % (s, sources[s]["url"]) for s in linked), "\n".join(facts) or lead.get("reason", "事实待核"), "\n".join(gaps), "\n".join(actions), lead.get("address", "未知"), lead.get("buyer_type", "待核"), lead.get("priority") or "未评级", lead.get("manual_notes", ""), "\n".join(relations_text) or "尚无已核市场关系", boundary]
+        row = ["、".join(x for x in countries if x) or "待核", "、".join(x for x in cities if x) or "待核", "；".join(markets) or "待市场定位", kind, customer_pool_label(lead, sources), lead["lead_id"], lead["name"], "、".join(matched_products(lead, task, sources) if lead["status"] == "main" else sorted({p["product"] for p in lead.get("product_evidence", []) if p["product"] in task.get("products", [])})) or "待核", "已核" if review["white_label_status"] == "verified" else "待核", "、".join(review["white_label_products"]) or "尚无足够证据", "\n".join(contact_display(c, lead.get("qualification_batch_id", batch_id)) for c in lead.get("contacts", [])), "\n".join("[%s] %s" % (s, sources[s]["url"]) for s in linked), "\n".join(facts) or lead.get("reason", "事实待核"), "\n".join(gaps), "\n".join(actions), lead.get("address", "未知"), lead.get("buyer_type", "待核"), lead.get("priority") or "未评级", lead.get("manual_notes", ""), "\n".join(relations_text) or "尚无已核市场关系", boundary]
         rows.append(row)
     rows.sort(key=lambda row: tuple(normalized(row[i]) for i in (0, 1, 2, 3)) + (0 if row[4] == "正式" else 1, row[5]))
     if not rows:
@@ -1507,7 +1519,7 @@ def export_single_sheet(master, batch, batch_id, output):
         row[-1] = boundary
         rows.append(row)
     write_xlsx(output, [("客户总表", [header] + rows, widths)])
-    return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": counts, "sheets": 1, "output_layout": "single_sheet", "customer_rows": len(selected), "master_modified": False}
+    return {"output": str(Path(output).resolve()), "batch_id": batch_id, "counts": counts, "delivery_counts": delivery_counts, "sheets": 1, "output_layout": "single_sheet", "customer_rows": len(selected), "master_modified": False}
 
 
 def export_view(master, batch, batch_id, output):

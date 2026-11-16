@@ -194,11 +194,64 @@ def _mutable(master, batch_id, log):
 
 
 def _entry_identity(entry):
+    """Legacy identity retained for immutable history written before request keys."""
     if entry.get("kind") == "link":
         # Tool-visible link IDs are scoped to the observed parent page, not the
         # guessed destination or a newly named source/channel/purpose.
         return core.digest_bytes(core.encoded({"kind": "link", "parent_url": entry["parent_url"], "link_id": str(entry["link_id"]).strip()}))
     return core.digest_bytes(core.encoded({key: entry.get(key) for key in ("channel_id", "kind", "url", "query", "input_reference", "cursor", "scope", "purpose")}))
+
+
+def _request_identity(entry):
+    """Identify the actual read, not its assignment, purpose or qualification scope."""
+    kind = entry["kind"]
+    if kind == "link":
+        return _entry_identity(entry)
+    cursor = entry.get("cursor")
+    if isinstance(cursor, str) and not cursor.strip():
+        cursor = None
+    fields = {"kind": kind, "cursor": cursor}
+    if kind == "page":
+        fields["url"] = entry.get("url")
+    elif kind == "query":
+        # A stable search channel identifies the actual provider. Two engines
+        # may legitimately return different results for the same query.
+        fields.update(channel_id=entry.get("channel_id"), query=entry.get("query"))
+    else:
+        fields["input_reference"] = entry.get("input_reference")
+    return core.digest_bytes(core.encoded(fields))
+
+
+def _matching_read_history(root, log, entry):
+    identity = _request_identity(entry)
+    legacy_identity = _entry_identity(entry)
+    matches, origins = [], {}
+    for prior in log["read_history"]:
+        historical_identity = prior.get("request_identity")
+        if historical_identity is None and prior.get("entry_identity") == legacy_identity:
+            matches.append(prior)
+            continue
+        if historical_identity is None:
+            # Old records preserve a hash plus their origin, not request fields.
+            # Read the immutable origin; never rewrite it or invent a v2 hash.
+            bid, eid = prior.get("batch_id"), prior.get("entry_id")
+            core.valid_id(bid, "historical batch_id", core.BATCH_RE)
+            core.valid_id(eid, "historical entry_id")
+            if bid not in origins:
+                folder = root / "research" / bid
+                path = folder / "research-log.json"
+                core.require(not folder.is_symlink() and not path.is_symlink() and path.is_file(),
+                             "Restore the original research log to check legacy request history: " + str(path))
+                origin = core.read_json(path)
+                core.require(origin.get("batch_id") == bid, "Legacy request history origin has a different batch_id")
+                origins[bid] = origin
+            observed = origins[bid].get("entries", {}).get(eid)
+            core.require(observed and _entry_identity(observed) == prior.get("entry_identity"),
+                         "Legacy request history does not match its original entry")
+            historical_identity = _request_identity(observed)
+        if historical_identity == identity:
+            matches.append(prior)
+    return matches
 
 
 def _link_context(entry, sources):
@@ -231,8 +284,12 @@ def _last_failure(log, entry):
 
 
 def _retry_gate(log, entry, condition, enforce_planned=False):
-    previous = [a for a in log["attempts"].values() if a["entry_id"] == entry["entry_id"]]
-    prior_conditions = set(entry.get("prior_attempt_conditions", [])) | {a.get("retry_condition", "") for a in previous}
+    # Pre-fix logs can already contain differently named entries for one read.
+    # Keep those records intact, but do not let an alias discard retry history.
+    related = [e for e in log["entries"].values() if _request_identity(e) == _request_identity(entry)]
+    ids = {e["entry_id"] for e in related} | {entry["entry_id"]}
+    previous = [a for a in log["attempts"].values() if a["entry_id"] in ids]
+    prior_conditions = {c for e in related for c in e.get("prior_attempt_conditions", [])} | {a.get("retry_condition", "") for a in previous}
     if prior_conditions or previous:
         core.nonempty(condition, "Repeated entry needs an actual changed retry_condition")
         core.require(condition not in prior_conditions, "Retry condition has not changed")
@@ -683,9 +740,9 @@ def plan_entry(root, batch_id, entry, defer=False):
             return {"entry_id": entry["entry_id"], "already_planned": True, "state": old["state"], "executable": not defer, "deferred": defer, "registered_at": old.get("registered_at")}
         if not defer:
             _route_gate(log, stored)
-        identity = _entry_identity(stored)
-        core.require(not any(_entry_identity(x) == identity for x in log["entries"].values()), "Same entry already planned; reuse its stable entry_id")
-        history = [x for x in log["read_history"] if x["entry_identity"] == identity]
+        identity = _request_identity(stored)
+        core.require(not any(_request_identity(x) == identity for x in log["entries"].values()), "Same entry already planned; reuse its stable entry_id")
+        history = _matching_read_history(root, log, stored)
         if history:
             condition = stored.get("retry_condition")
             core.nonempty(condition, "Previously processed entry needs a changed retry_condition")
@@ -1073,7 +1130,7 @@ def carry_forward(root, from_id, to_id):
         for entry in old_log["entries"].values():
             conditions = sorted(set(entry.get("prior_attempt_conditions", [])) | {a.get("retry_condition", "") for a in old_log["attempts"].values() if a["entry_id"] == entry["entry_id"]})
             if entry["state"] == "done":
-                log["read_history"].append({"entry_identity": _entry_identity(entry), "entry_id": entry["entry_id"], "batch_id": from_id, "attempt_conditions": conditions})
+                log["read_history"].append({"entry_identity": _entry_identity(entry), "request_identity": _request_identity(entry), "entry_id": entry["entry_id"], "batch_id": from_id, "attempt_conditions": conditions})
             else:
                 carry = copy.deepcopy(entry)
                 failure = _last_failure(old_log, entry)

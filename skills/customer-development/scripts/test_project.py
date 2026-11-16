@@ -68,6 +68,113 @@ class ProjectBindingTests(unittest.TestCase):
         self.assertEqual(before, (self.root / "old.xlsx").read_bytes())
         self.assertFalse((self.root / "execution/master.json").exists())
 
+    def excel_task(self, task_id="old-task"):
+        task_path = "research/%s/task.json" % task_id
+        log_path = "research/%s/research-log.json" % task_id
+        (self.root / task_path).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "execution").mkdir(exist_ok=True)
+        core.safe_write(self.root / task_path, {"task_id": task_id, "backend": "xlsx", "state": "partial",
+                        "scope": {"countries": ["测试国"], "products": core.PRODUCTS, "supplementary_products": []},
+                        "master": {"path": "old.xlsx"}, "next_action": "Old frozen next action"})
+        core.safe_write(self.root / log_path, {"task_id": task_id, "backend": "xlsx", "attempts": [], "started_at": core.now()})
+        return {"task_path": task_path, "research_log_path": log_path, "master_path": "old.xlsx", "state": "partial"}
+
+    def test_excel_inspect_exposes_active_task_scope_and_current_correction_read_only(self):
+        self.excel_project()
+        entry = self.excel_task()
+        core.safe_write(self.root / "company.json", {"products": ["智能眼镜"], "supplementary_products": ["蓝牙耳机"], "rules_version": core.VERSION})
+        core.safe_write(self.root / "execution/current-review.json", {"next_action": "Current corrected discovery instructions", "rules_version": core.VERSION})
+        core.safe_write(self.root / "execution/excel-task-index.json", {"schema_version": 1, "backend": "xlsx", "active_task_id": "old-task", "tasks": {"old-task": entry},
+                        "continuation_review": {"path": "execution/current-review.json", "next_action": "Older inline correction"}})
+        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        report = project.inspect(self.root)
+        context = report["task_context"]
+        self.assertTrue(context["resume_ready"])
+        self.assertEqual(context["active_task_id"], "old-task")
+        self.assertEqual(context["research_log"]["path"], entry["research_log_path"])
+        self.assertEqual(context["saved_next_action"], "Old frozen next action")
+        self.assertEqual(report["next_action"], "Current corrected discovery instructions")
+        review = context["configuration_review"]
+        self.assertTrue(review["product_scope_differs"])
+        self.assertEqual(review["differences"]["supplementary_products"]["only_in_defaults"], ["蓝牙耳机"])
+        self.assertFalse(review["scope_changed_automatically"])
+        self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
+        self.assertFalse((self.root / "execution/master.json").exists())
+
+    def test_excel_inspect_old_project_without_index_and_single_task_are_read_only(self):
+        self.excel_project()
+        report = project.inspect(self.root)
+        self.assertTrue(report["ready"])
+        self.assertFalse(report["task_context"]["task_found"])
+        self.assertFalse((self.root / "execution/excel-task-index.json").exists())
+        entry = self.excel_task()
+        index = {"schema_version": 1, "tasks": {"old-task": entry}}
+        core.safe_write(self.root / "execution/excel-task-index.json", index)
+        context = project.inspect(self.root)["task_context"]
+        self.assertTrue(context["resume_ready"])
+        self.assertEqual(context["selection_basis"], "only_indexed_task_without_writing_pointer")
+        self.assertEqual(core.read_json(self.root / "execution/excel-task-index.json"), index)
+
+    def test_excel_inspect_never_guesses_between_tasks_or_uses_a_stale_pointer(self):
+        self.excel_project()
+        index = {"schema_version": 1, "backend": "xlsx", "tasks": {"older": self.excel_task("older"), "newer": self.excel_task("newer")}}
+        for pointer in (None, "not-in-index"):
+            with self.subTest(pointer=pointer):
+                index["active_task_id"] = pointer
+                core.safe_write(self.root / "execution/excel-task-index.json", index)
+                context = project.inspect(self.root)["task_context"]
+                self.assertTrue(context["selection_required"])
+                self.assertFalse(context["resume_ready"])
+                self.assertIsNone(context["active_task_id"])
+                self.assertEqual(context["candidates"], ["newer", "older"])
+
+    def test_excel_inspect_missing_task_log_does_not_initialize_a_replacement(self):
+        self.excel_project()
+        entry = self.excel_task()
+        core.safe_write(self.root / "execution/excel-task-index.json", {"schema_version": 1, "active_task_id": "old-task", "tasks": {"old-task": entry}})
+        (self.root / entry["research_log_path"]).unlink()
+        context = project.inspect(self.root)["task_context"]
+        self.assertFalse(context["resume_ready"])
+        self.assertFalse(context["research_log"]["exists"])
+        self.assertFalse((self.root / entry["research_log_path"]).exists())
+        self.assertFalse((self.root / "execution/master.json").exists())
+
+    def test_excel_inspect_rejects_unsafe_paths_wrong_task_and_different_master(self):
+        self.excel_project()
+        entry = self.excel_task()
+        index_path = self.root / "execution/excel-task-index.json"
+        index = {"schema_version": 1, "active_task_id": "old-task", "tasks": {"old-task": entry}}
+        for changes, message in [({"task_path": "../../outside.json"}, "within the bound project"),
+                                 ({"master_path": "different.xlsx"}, "different master")]:
+            with self.subTest(changes=changes):
+                core.safe_write(index_path, dict(index, tasks={"old-task": dict(entry, **changes)}))
+                with self.assertRaisesRegex(core.LeadkitError, message):
+                    project.inspect(self.root)
+        core.safe_write(index_path, index)
+        task = core.read_json(self.root / entry["task_path"])
+        task["task_id"] = "some-other-task"
+        core.safe_write(self.root / entry["task_path"], task)
+        with self.assertRaisesRegex(core.LeadkitError, "task ID does not match"):
+            project.inspect(self.root)
+
+    def test_excel_inspect_version_and_missing_old_field_do_not_invent_product_drift(self):
+        self.excel_project()
+        entry = self.excel_task()
+        task_path = self.root / entry["task_path"]
+        task = core.read_json(task_path)
+        task["scope"].pop("supplementary_products")
+        task["rules_version"] = "historical-test-version"
+        task["customer_profile"] = {"brand_policy": "white_label_required", "collect_brand_stores": False}
+        core.safe_write(task_path, task)
+        core.safe_write(self.root / "execution/excel-task-index.json", {"schema_version": 1, "active_task_id": "old-task", "tasks": {"old-task": entry}})
+        review = project.inspect(self.root)["task_context"]["configuration_review"]
+        self.assertFalse(review["product_scope_differs"])
+        self.assertEqual(review["unknown_task_fields"], ["supplementary_products"])
+        self.assertEqual(review["rules_versions"]["task"], "historical-test-version")
+        self.assertTrue(review["policy_scope_differs"])
+        self.assertEqual(review["policy_differences"]["brand_policy"]["task"], "white_label_required")
+        self.assertEqual(core.read_json(task_path), task)
+
     def test_binding_change_requires_reason_and_preserves_previous(self):
         self.excel_project()
         core.write_xlsx(self.root / "reviewed.xlsx", [("Customers", [["ID"], ["TEST-2"]], [20])])

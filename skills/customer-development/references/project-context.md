@@ -8,7 +8,9 @@
 python3 <SKILL_DIR>/scripts/leadkit_project.py inspect --project <当前项目目录>
 ```
 
-有绑定时返回project_root、master、company_config、active_rules、additional_sources及缺失情况。JSON使用返回的workspace；Excel沿用返回的工作簿，不调用JSON的init/snapshot。缺失源先恢复，或报告缺少的历史范围；不能宣称企业净新增。配置或规则hash变化时读取真实变更，新任务记录当前版本，旧批次不改写。日常主库新增内容不要求重新绑定。
+有绑定时返回project_root、master、company_config、active_rules、additional_sources及缺失情况。先以active_rules和company_config定位项目当前要求；README中的历史进度和旧任务快照不是另一套当前规则。JSON使用返回的workspace；Excel沿用返回的工作簿，不调用JSON的init/snapshot。缺失源先恢复，或报告缺少的历史范围；不能宣称企业净新增。配置或规则hash变化时读取真实变更，不把hash变化直接当业务范围变化。发现方法和程序修复可用于当前任务，保留预算与原日志；产品、地域或准入政策明确改变时另建对应任务，旧批次不改写。日常主库新增内容不要求重新绑定。
+
+Excel项目另返回task_context，直接定位现有execution/excel-task-index.json中的活动任务：active_task_id、task_file、research_log、task_state及resume_ready。configuration_review区分已保存产品／政策与当前默认的差异、规则版本和旧字段缺失；未知字段不推定为产品变化。continuation_review存在时优先显示当前纠正记录，旧任务动作保存在saved_next_action供历史参考。inspect只读取，不创建索引、任务或客户库；无索引时定位已有研究，多任务无有效指针时返回候选而不按日期猜测。
 
 没有绑定：定位真实历史文件、公司默认配置及当前有效规则。明确历史权威文件后bind；只有确实全新且没有历史的工作区才用leadkit.py init（自动建立绑定）。历史范围不清时先查项目文件，必要时集中确认，不能随意挑最近的文件为主库。
 
@@ -46,7 +48,9 @@ python3 <SKILL_DIR>/scripts/leadkit_workflow.py setup-project --workspace <项�
 
 实际更新先备份、核原件hash及人工栏，另写临时结果并回读；只能在合并成功后说主表已更新。不能安全合并则交付有稳定ID的增量表及待合并说明。Excel任务另外维护execution/excel-task-index.json：schema_version=1、backend="xlsx"、active_task_id以及tasks字典；每个任务索引含task_path、research_log_path、state、deliveries，路径相对项目根。任务文件记录task_id及上述请求、范围、hash、预算和时间，日志保存实际入口与尝试。它是Codex维护的Excel接续记录，不是JSON主库，也不宣称可使用JSON工作流CLI。
 
-新窗口先按active_task_id读取同一task.json和research-log.json，保留已开始时间及已用预算。另对比当前公司products/supplementary_products与任务已保存范围；说明差异而不静默改任务。用户已要求采用新主营定位时另建任务，原任务保留。旧Excel项目还没有索引时扫描真实未完成研究；只有唯一任务才自动关联，多任务且无明确活动指针时集中确认，不能按修改时间挑最近任务。更新索引保留旧任务；继续真实未读入口，不清空研究。
+新窗口按inspect返回的task_context读取同一task.json和research-log.json，保留已开始时间及已用预算，并先处理当前接续纠正。另对比当前公司products/supplementary_products与任务已保存范围；说明差异而不静默改任务。用户已要求采用新主营定位时另建任务，原任务保留。旧Excel项目还没有索引时扫描真实未完成研究；只有唯一任务才自动关联，多任务且无明确活动指针时集中确认，不能按修改时间挑最近任务。更新索引保留旧任务；继续真实未读入口，不清空研究。
+
+Excel采集复用这些日志中的实际query、URL、页码／游标、回执、失败条件和已派发入口，先核是否已经处理，再安排新访问。同页不同实际范围和条件已变化的重读另记依据；换用途、分工名称或entry_id不代表新入口。日志格式与JSON账本不同时由Codex按原记录核对，不能为套用JSON闸门再生一套主库，也不能声称已经通过未执行的CLI校验。请求身份及重试口径见[research-progress.md](research-progress.md)。
 
 ## 当前配置与已保存任务的差异
 

@@ -1,10 +1,10 @@
-# 本地运行与数据契约 · 1.5
+# 本地运行与数据契约 · 1.6.0
 
 脚本只校验和保存已研究的记录，不联网、不证明来源真实。Codex须实际阅读证据并判断归属。Python 3.9+标准库即可。优先用snapshot生成结构，参照[虚构示例](../assets/batch-example.json)，不要猜字段。全部JSON用UTF-8；员工不负责填写JSON。
 
 ## 命令与版本
 
-`<SKILL_DIR>`是本SKILL.md所在目录，`<PROJECT>`是独立客户工作区；路径有空格需加引号。Windows可用`py -3`。
+`<SKILL_DIR>`是本SKILL.md所在目录，`<PROJECT>`是独立客户工作区；路径有空格需加引号。Windows可用`py -3`。先用project inspect定位绑定和当前任务；以下主库CLI适用于JSON，已有Excel使用[项目入口中的Excel分支](project-context.md#excel主库的执行分支)，不能为执行init新建第二套库。
 
 ```text
 python3 <SKILL_DIR>/scripts/leadkit.py init --workspace <PROJECT>
@@ -67,6 +67,8 @@ sources每项必填`source_id,url,title,read_at,level,excerpt`；url为不含凭
 ## 客户及准入
 
 每条lead必填`lead_id,name,country,status,reason,discovered_by`（发现渠道的精确结构见下文覆盖部分），status是**本次任务资格**：main/candidate/excluded，不是全局经营状态。新政策下main包含独立商户及满足条件的品牌店；collection_segment由运行层推导为independent／brand_store，分别交付和计数，不能手填分组绕过身份核验。可填city、market、address、market_location、aliases和人工初始备注；研究更新保留原manual_notes/manual_owner/sales_stage。
+
+相关商户先以candidate保存再补证。渠道储备仍是candidate，不新增资格枚举：channel_fit写实际相关成品／手机配件转售依据，channel_source_ids引用可读来源。单表导出据此显示“渠道储备”；其他candidate显示“待核”，均不计正式客户。main仍须通过下列全部条件，不以储备标签替代产品证据。只有普通元件、维修材料等且无相关渠道依据的对象留在研究目录观察中，不作为本轮客户记录凑数；历史原件和冻结交付不删除。
 
 main需要以下所有条件；不能用分数抵消缺项：
 
@@ -135,6 +137,8 @@ coverage在**批次顶层**保存，每项`{product,channel,status,attempts,sour
 lead.discovered_by为`[{channel,source_ids}]`，记录实际发现路径；多渠道同一主体只算一个新增。覆盖中的客户ID须能追溯到本批记录，准备阶段隔离坏行仍保留拒绝明细与修复事项，不假称覆盖已完成。
 
 批次counts保存本轮main/candidate/excluded数量；新政策另列independent_main与brand_store_main，品牌店不充独立商户数量目标。另分别记录new_entities、new_qualified_entities（本轮前未在主库出现且本轮合格的规范主体）、updated_entities、requalified（同范围重新合格）、first_qualified（主体首次在该范围合格，包含新主体）、new_contacts、new_sources。新增来源、补一个电话或已有候选晋级不等于新增主体。这些指标有交叉，不相加成客户总数；不要用main总数冒充新增客户。
+
+渠道储备是candidate的展示子集，单表的“渠道储备”和“待核”分别计数，不能再与candidate总数相加。目录观察数量仅用于研究覆盖，不计客户数。请求去重使用运行层生成的request_identity并兼容旧entry_identity；它不改变实体去重、资格scope或预算计数，精确规则见[研究进度](research-progress.md#请求复用与旧日志)。
 
 ## 保存与交付
 
