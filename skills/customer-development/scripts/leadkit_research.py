@@ -17,7 +17,7 @@ import leadkit as core
 CHANNEL_KINDS = {"search", "website", "map", "market", "ecommerce", "social", "trade", "association", "rfq", "provided", "related"}
 READINESS = {"readable", "needs_auth", "blocked", "untested"}
 ATTEMPT_STATES = {"read", "empty", "blocked", "needs_auth", "failed"}
-STOP_REASONS = {"target_reached", "coverage_complete", "market_complete", "attempt_budget", "time_budget", "paths_exhausted", "access_blocked", "needs_business_reply", "user_stopped", "batch_complete"}
+STOP_REASONS = {"target_reached", "coverage_complete", "market_complete", "scope_review_required", "attempt_budget", "time_budget", "paths_exhausted", "access_blocked", "needs_business_reply", "user_stopped", "batch_complete"}
 MAP_CATEGORIES = {"offline_markets", "wholesale_import_distributors", "retail_malls_supermarkets", "online_sellers", "social", "trade_associations"}
 ENTRY_PURPOSES = {"channel_research", "route_reconnaissance", "merchant_collection"}
 WORK_KINDS = {"discovery", "qualification", "contact"}
@@ -276,6 +276,7 @@ def _market_sequence(log):
         any(c["country_id"] == country_id for c in cities.values()) for country_id in countries)
     return {"directory": copy.deepcopy(directory), "active_market_id": active_id,
             "active_market": active, "active_market_complete": complete,
+            "needs_scope_review": bool(market and market.get("state") == "review_required"),
             "next_market_id": unfinished[0] if complete and unfinished else None,
             "remaining_market_ids": unfinished,
             "recorded_queue_complete": queue_complete, "directory_complete": directory_complete,
@@ -370,6 +371,7 @@ def _plan_status(log):
                       scope_completion="complete" if done else "partial", collection_complete=done,
                       next_route_id=current_routes[0]["route_id"] if current_routes and ready and not sequence["active_market_complete"] else None,
                       next_action="当前市场已完成；将该市场结果合入客户总表，下一批才进入下一市场" if sequence["active_market_complete"] else
+                                  "当前市场需范围复核且仍未完成；可继续本市场调查，或交接给用户决定是否另建调整范围任务，不自动进入下一市场" if sequence["needs_scope_review"] else
                                   "先完成当前城市的渠道与联系预研" if not ready else "继续当前市场的未读商户；预算结束仍接续本市场")
     return result
 
@@ -554,12 +556,16 @@ def route_progress(root, batch_id, route_id, update):
 
 
 def market_progress(root, batch_id, market_id, update):
-    """Close only an observed active-market boundary; the next batch advances."""
+    """Record an evidenced boundary completion or a nonblocking scope review."""
     core.valid_id(market_id, "market_id")
-    core.require(isinstance(update, dict) and update.get("state") == "complete", "market-progress supports evidenced state=complete only")
+    core.require(isinstance(update, dict) and update.get("state") in {"complete", "review_required"}, "market-progress supports evidenced state=complete/review_required only")
+    review = update["state"] == "review_required"
     for key in ("detail", "boundary", "cursor"):
         core.nonempty(update.get(key), "market progress." + key)
-    core.require(update.get("directory_exhausted") is True, "Market completion needs directory_exhausted=true for its observed boundary")
+    if review:
+        core.require(update.get("directory_exhausted") is False, "Market scope review needs directory_exhausted=false; it does not complete the market")
+    else:
+        core.require(update.get("directory_exhausted") is True, "Market completion needs directory_exhausted=true for its observed boundary")
     core.string_list(update.get("attempt_ids", []), "market progress.attempt_ids")
     with core.locked(root):
         folder, baseline, master, sha, packet = _context(root, batch_id)
@@ -568,22 +574,34 @@ def market_progress(root, batch_id, market_id, update):
         core.require(log["policy"]["collection_strategy"] == "market_sequence", "market-progress requires market_sequence")
         report = _plan_status(log)
         sequence = report.get("market_sequence", {})
-        core.require(sequence.get("active_market_id") == market_id, "Only this batch's active market can be completed")
-        core.require(report["preflight_ready"], "Market completion requires current-city preflight")
+        core.require(sequence.get("active_market_id") == market_id, "Only this batch's active market can change market progress")
+        if review:
+            core.require(not sequence["active_market_complete"], "A completed market cannot be relabeled review_required")
+        else:
+            core.require(report["preflight_ready"], "Market completion requires current-city preflight")
         sources = _sources(packet, master)
         core.refs(update.get("source_ids", []), "market completion.source_ids", sources, strong=True)
         plan = log["collection_plan"]
         routes = {rid: r for rid, r in plan["routes"].items() if r.get("market_id") == market_id}
-        core.require(routes and all(r["state"] in {"complete", "empty"} for r in routes.values()), "Market still has uncompleted, blocked, skipped or deferred routes")
-        core.require(not any(e.get("route_id") in routes and e["state"] != "done" for e in log["entries"].values()), "Market still has unread or blocked observed entries")
+        if not review:
+            core.require(routes and all(r["state"] in {"complete", "empty"} for r in routes.values()), "Market still has uncompleted, blocked, skipped or deferred routes")
+            core.require(not any(e.get("route_id") in routes and e["state"] != "done" for e in log["entries"].values()), "Market still has unread or blocked observed entries")
         attempts = [log["attempts"].get(aid) for aid in update.get("attempt_ids", [])]
-        core.require(attempts and all(a and log["entries"][a["entry_id"]].get("route_id") in routes for a in attempts), "Market completion needs its own real boundary attempts")
-        core.require(any(a["status"] == "read" and set(a.get("source_ids", [])) & set(update["source_ids"]) for a in attempts), "Market completion sources must be linked to an actual readable boundary attempt")
+        core.require(attempts and all(a and log["entries"][a["entry_id"]].get("route_id") in routes for a in attempts), "Market progress needs its own real boundary attempts")
+        if review:
+            core.require(all(log["entries"][a["entry_id"]].get("purpose") in {"route_reconnaissance", "merchant_collection"} for a in attempts), "Market scope review needs market reconnaissance or merchant attempts")
+            read_sources = {sid for a in attempts if a["status"] == "read" for sid in a.get("source_ids", [])}
+            core.require(set(update["source_ids"]) <= read_sources, "Market scope review sources must all be linked to actual readable attempts")
+        else:
+            core.require(any(a["status"] == "read" and set(a.get("source_ids", [])) & set(update["source_ids"]) for a in attempts), "Market completion sources must be linked to an actual readable boundary attempt")
         market = next(m for m in plan["market_directory"]["markets"] if m["market_id"] == market_id)
         if market.get("progress"):
             market.setdefault("progress_history", []).append(market["progress"])
-        market.update(state="complete", progress=dict(copy.deepcopy(update), recorded_at=core.now(),
-                                                       completion_scope="observed_directory_boundary"))
+        progress = dict(copy.deepcopy(update), recorded_at=core.now(),
+                        completion_scope="partial" if review else "observed_directory_boundary")
+        if review:
+            progress["review_batch_id"] = batch_id
+        market.update(state=update["state"], progress=progress)
         core.safe_write(folder / "research-log.json", log)
         return _plan_status(log)
 
@@ -910,7 +928,8 @@ def _summarize(log, baseline, packet, master, as_of=None):
     result["research_effort"], result["allocation_review"] = _research_effort(log, proposed, old, seen, qualified)
     result["blocked_conditions"] = {eid: _last_failure(log, log["entries"][eid]) for eid in blocked}
     if reason:
-        result["next_action"] = "保存实际成果并交付；明确剩余路线及本次覆盖边界" if collection.get("scope_completion") == "partial" else "保存实际成果并交付"
+        result["next_action"] = ("保存阶段成果及范围复核依据，交由用户决定；当前市场仍未完成，继续时仍调查本市场，调整范围须另建任务" if reason == "scope_review_required" else
+                                 "保存实际成果并交付；明确剩余路线及本次覆盖边界" if collection.get("scope_completion") == "partial" else "保存实际成果并交付")
     return result
 
 
@@ -951,6 +970,11 @@ def finish(root, batch_id, reason, detail, packet=None, revision_detail=None):
             core.require(report.get("collection_complete"), "Collection remains partial; coverage completion requires an observed collection plan")
         if reason == "market_complete":
             core.require(report.get("market_sequence", {}).get("active_market_complete"), "Market completion requires an evidenced market-progress record")
+        if reason == "scope_review_required":
+            sequence = report.get("market_sequence", {})
+            progress = (sequence.get("active_market") or {}).get("progress", {})
+            core.require(sequence.get("needs_scope_review") and progress.get("review_batch_id") == batch_id,
+                         "Scope-review finish requires an evidenced review_required market-progress record from this round")
         if log["policy"]["collection_strategy"] in SYSTEMATIC_STRATEGIES:
             if reason in {"batch_complete", "paths_exhausted", "coverage_complete"}:
                 core.require(report["collection_complete"], "Collection remains partial; finish a budget/access checkpoint and preserve unfinished routes")

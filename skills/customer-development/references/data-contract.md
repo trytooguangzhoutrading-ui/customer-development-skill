@@ -35,7 +35,7 @@ batch_id为1–80位ASCII字母/数字/下划线/短横线，以字母或数字�
 | customer_profile | `{buyer_types:[...],brand_policy:"independent_product",collect_brand_stores:true,supplier_constraints:{...}}`为新默认；未知供货条件不填事实。旧white_label_required保留原政策，不能同时开启品牌店采集 |
 | geo_scope | 范围对象数组，每项`country`及可选`city`、`market`、`address`；省略时从countries与旧city/market/address规范化 |
 | activity_max_age_days | 活动证据评估窗口，默认180，允许1–730；只影响A评级，不直接淘汰B |
-| allow_channel_candidates | 布尔值，默认false；允许相邻渠道候选，不豁免main门槛 |
+| allow_channel_candidates | 布尔值，新任务默认true；保留有据相关成品／手机配件转售渠道候选，不豁免main目标产品等门槛；旧任务按原值。true时声明channel_fit须有可读channel_source_ids，不表示任意电子商户均相关 |
 
 mode为new/continue/enrich；target_count为正整数，默认20；target_metric为new_qualified/qualified/updated，新采及继续默认new_qualified，补证默认updated。work_budget:{max_attempts:80,max_minutes:45}是每轮上限，次数正整数，分钟大于0且不超过1440，员工明确要求覆盖默认。运行账本与结束顺序见[research-progress.md](research-progress.md)。数量是目标而非最低交付承诺；默认合格统计只按五类主营products，附带音频线索不充数。供货条件包括已确认的产品、价格带、MOQ和供货方式，未确认不猜。任务资格按规范化范围存储，与原始需求措辞、数量目标分开；实体在另一产品或地域任务不匹配不抹掉已有资格。
 

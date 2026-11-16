@@ -1208,6 +1208,149 @@ class ResearchTests(unittest.TestCase):
         return research.market_progress(self.root, packet["batch_id"], mid, {
             "state": "complete", "detail": "Synthetic observed directory boundary has been read", "boundary": "Observed page 1 and its disclosed merchant links only", "cursor": "page=1,end", "attempt_ids": ["attempt-" + size], "source_ids": [packet["sources"][0]["source_id"]], "directory_exhausted": True})
 
+    def scope_review_update(self, packet, **changes):
+        update = {"state": "review_required", "detail": "Synthetic observed entries are component sellers; target-product fit remains unproven and needs a scope decision",
+                  "boundary": "Only the actually read synthetic directory page; not the whole market", "cursor": "page=1,remaining=unknown",
+                  "attempt_ids": ["attempt-1"], "source_ids": [packet["sources"][0]["source_id"]], "directory_exhausted": False}
+        update.update(changes)
+        return update
+
+    def test_unknown_market_product_fit_does_not_block_named_discovery(self):
+        packet = self.market_packet()
+        packet["leads"][0]["status"] = "candidate"
+        self.save(packet)
+        plan = self.market_plan(packet)
+        plan["market_directory"]["markets"][0]["priority_basis"] = "Electronics market observed; wearable-product fit unknown, no density claim"
+        research.collection_plan(self.root, packet["batch_id"], plan)
+        self.route_entry(packet, "large", work_kind="discovery")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        report = research.status(self.root, packet["batch_id"])
+        self.assertEqual(report["research_effort"]["overall"]["unique_discovered"], 1)
+        self.assertEqual(report["counts"]["new_qualified"], 0)
+        self.assertFalse(report["market_sequence"]["needs_scope_review"])
+        self.assertFalse(report["should_stop"])
+
+    def test_scope_review_preserves_unfinished_market_and_allows_more_investigation(self):
+        packet = self.market_packet()
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        self.route_entry(packet, "large", purpose="route_reconnaissance")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large", discovered_lead_ids=[]))
+        before = self.log()
+        master_hash = kit.load_master(self.root)[1]
+        result = research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet, review_batch_id="forged"))
+        sequence = result["market_sequence"]
+        self.assertTrue(sequence["needs_scope_review"])
+        self.assertFalse(sequence["active_market_complete"])
+        self.assertIsNone(sequence["next_market_id"])
+        self.assertEqual(sequence["active_market"]["progress"]["review_batch_id"], packet["batch_id"])
+        self.assertEqual(sequence["active_market"]["progress"]["completion_scope"], "partial")
+        self.assertEqual(result["scope_completion"], "partial")
+        self.assertEqual(kit.load_master(self.root)[1], master_hash)
+        after = self.log()
+        for field in ("scope_id", "started_at", "policy", "attempts", "entries", "read_history"):
+            self.assertEqual(after[field], before[field])
+        report = research.status(self.root, packet["batch_id"])
+        self.assertFalse(report["should_stop"])
+        self.assertIn("范围复核", report["next_action"])
+        self.route_entry(packet, "large", entry_id="further-discovery", url="https://example.invalid/further", work_kind="discovery")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="attempt-further", eid="further-discovery"))
+        self.assertEqual(research.status(self.root, packet["batch_id"])["attempts"], 2)
+        with self.assertRaisesRegex(kit.LeadkitError, "restricted to the active market"):
+            self.route_entry(packet, "medium")
+
+    def test_scope_review_rejects_unread_failed_unlinked_and_other_market_evidence(self):
+        packet = self.market_packet()
+        packet["sources"].append(dict(packet["sources"][0], source_id="SRC-UNREAD", url="https://example.invalid/unread"))
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        self.route_entry(packet, "large", entry_id="failed", url="https://example.invalid/failed", purpose="route_reconnaissance")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="attempt-failed", eid="failed", state="failed"))
+        self.route_entry(packet, "medium", purpose="route_reconnaissance")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="attempt-other", eid="entry-medium", discovered_lead_ids=[]))
+        self.route_entry(packet, "large", purpose="route_reconnaissance")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large", discovered_lead_ids=[]))
+        self.route_entry(packet, "large", entry_id="city-background", url="https://example.invalid/background", purpose="channel_research")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, aid="attempt-background", eid="city-background", discovered_lead_ids=[]))
+        cases = [({"attempt_ids": []}, "own real boundary attempts"),
+                 ({"attempt_ids": ["not-recorded"]}, "own real boundary attempts"),
+                 ({"attempt_ids": ["attempt-failed"]}, "actual readable attempts"),
+                 ({"attempt_ids": ["attempt-other"]}, "own real boundary attempts"),
+                 ({"source_ids": ["SRC-001", "SRC-UNREAD"]}, "actual readable attempts"),
+                 ({"attempt_ids": ["attempt-background"]}, "reconnaissance or merchant"),
+                 ({"directory_exhausted": True}, "directory_exhausted=false")]
+        before = self.log()
+        for changes, message in cases:
+            with self.subTest(changes=changes), self.assertRaisesRegex(kit.LeadkitError, message):
+                research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet, **changes))
+            self.assertEqual(self.log(), before)
+
+    def test_scope_review_can_record_reconnaissance_before_city_preflight_is_complete(self):
+        packet = self.market_packet()
+        plan = self.market_plan(packet)
+        plan["contact_ecosystem"] = []
+        research.collection_plan(self.root, packet["batch_id"], plan)
+        self.route_entry(packet, "large", purpose="route_reconnaissance")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large", discovered_lead_ids=[]))
+        report = research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet))
+        self.assertFalse(report["preflight_ready"])
+        self.assertTrue(report["market_sequence"]["needs_scope_review"])
+        with self.assertRaisesRegex(kit.LeadkitError, "preflight"):
+            self.route_entry(packet, "large", entry_id="merchant", url="https://example.invalid/merchant-new")
+
+    def test_scope_review_finish_before_budget_continues_same_market_without_reusing_old_review(self):
+        import leadkit_workflow as flow
+        packet = self.market_packet()
+        packet["leads"][0]["status"] = "candidate"
+        self.save(packet)
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        self.route_entry(packet, "large", work_kind="discovery")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        self.route_entry(packet, "large", entry_id="pending", url="https://example.invalid/pending", work_kind="discovery")
+        with self.assertRaisesRegex(kit.LeadkitError, "evidenced review_required"):
+            research.finish(self.root, packet["batch_id"], "scope_review_required", "No review record yet")
+        research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet))
+        research.finish(self.root, packet["batch_id"], "scope_review_required", "One actual read supports an early scope review; budget is not exhausted")
+        report = research.status(self.root, packet["batch_id"])
+        self.assertEqual(report["attempts"], 1)
+        self.assertLess(report["attempts"], report["policy"]["work_budget"]["max_attempts"])
+        self.assertEqual(report["stop_reason"], "scope_review_required")
+        self.assertTrue(report["should_stop"])
+        self.assertFalse(report["collection_complete"])
+        fixtures.LeadkitTests.commit(self, packet)
+        result = flow.continue_task(self.root, packet["batch_id"], "review-continued")
+        carried = result["carried_research"]["market_sequence"]
+        self.assertEqual(carried["active_market_id"], "market-a")
+        self.assertTrue(carried["needs_scope_review"])
+        self.assertIsNone(carried["next_market_id"])
+        report = research.status(self.root, "review-continued")
+        self.assertFalse(report["should_stop"])
+        self.assertIn("pending", report["pending_entry_ids"])
+        with self.assertRaisesRegex(kit.LeadkitError, "from this round"):
+            research.finish(self.root, "review-continued", "scope_review_required", "Cannot recycle the previous round's review without current evidence")
+        self.route_entry(result["packet"], "large", entry_id="new-evidence", url="https://example.invalid/new-evidence", purpose="route_reconnaissance")
+        research.record_attempt(self.root, "review-continued", self.attempt(packet, aid="new-attempt", eid="new-evidence", discovered_lead_ids=[]))
+        self.assertEqual(research.status(self.root, "review-continued")["attempts"], 1)
+        review = self.scope_review_update(packet, attempt_ids=["new-attempt"])
+        research.market_progress(self.root, "review-continued", "market-a", review)
+        research.finish(self.root, "review-continued", "scope_review_required", "A new actually read source supports this round's review")
+
+    def test_reviewed_market_can_complete_after_real_boundary_work_and_cannot_be_downgraded(self):
+        packet = self.market_packet()
+        research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))
+        self.route_entry(packet, "large")
+        research.record_attempt(self.root, packet["batch_id"], self.attempt(packet, eid="entry-large"))
+        research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet))
+        research.route_progress(self.root, packet["batch_id"], "route-large", {"state": "complete", "detail": "Synthetic actual observed page now processed", "cursor": "end", "attempt_ids": ["attempt-1"], "directory_exhausted": True})
+        result = research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet, state="complete", directory_exhausted=True))
+        self.assertTrue(result["market_sequence"]["active_market_complete"])
+        self.assertFalse(result["market_sequence"]["needs_scope_review"])
+        self.assertEqual(result["market_sequence"]["next_market_id"], "market-b")
+        self.assertEqual(result["market_sequence"]["active_market"]["progress_history"][0]["state"], "review_required")
+        with self.assertRaisesRegex(kit.LeadkitError, "completed market cannot"):
+            research.market_progress(self.root, packet["batch_id"], "market-a", self.scope_review_update(packet))
+        with self.assertRaisesRegex(kit.LeadkitError, "evidenced review_required"):
+            research.finish(self.root, packet["batch_id"], "scope_review_required", "The market has since completed")
+
     def test_market_sequence_restricts_merchants_but_allows_cross_market_reconnaissance(self):
         packet = self.market_packet()
         report = research.collection_plan(self.root, packet["batch_id"], self.market_plan(packet))

@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 PRIMARY_PRODUCTS = ["智能眼镜", "智能手表", "智能手表表带", "智能手环", "智能戒指"]
 SUPPLEMENTARY_PRODUCTS = ["蓝牙耳机", "蓝牙音响"]
 PRODUCTS = PRIMARY_PRODUCTS + SUPPLEMENTARY_PRODUCTS
@@ -157,7 +157,7 @@ def basic_snapshot(root, batch_id):
         target.mkdir()
         baseline = {"schema_version": 1, "batch_id": batch_id, "base_sha256": sha, "created_at": now(), "lead_ids": sorted(master["leads"])}
         safe_write(target / "snapshot.json", baseline)
-        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRIMARY_PRODUCTS, "requirements": [], "allow_channel_candidates": False, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "independent_product", "collect_brand_stores": True, "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
+        packet = {"schema_version": 3, "batch_id": batch_id, "base_sha256": sha, "task": {"request": "", "countries": [], "products": PRIMARY_PRODUCTS, "requirements": [], "allow_channel_candidates": True, "customer_profile": {"buyer_types": DEFAULT_BUYER_TYPES, "brand_policy": "independent_product", "collect_brand_stores": True, "supplier_constraints": {}}}, "region_research": [], "sources": [], "leads": [], "queue": [], "coverage": [], "limitations": []}
         packet["task"]["output_layout"] = "single_sheet"
         safe_write(target / "batch.json", packet)
     return {"batch_id": batch_id, "base_sha256": sha, "batch_path": str(target / "batch.json"), "snapshot_path": str(target / "snapshot.json")}

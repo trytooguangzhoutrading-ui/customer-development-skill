@@ -44,6 +44,8 @@ market_sequence的计划还必须包含market_directory及preflight_city_id：
 
 同父级order唯一，已有目录节点、名称、父级和顺序不能删除、改名或重排绕过未完成市场。新发现真实地区／市场可补登记，保留来源与完整性限制。
 
+priority_basis分别说明目标产品／转售渠道适配与总体规模的来源和未知范围，按[merchant-discovery.md](merchant-discovery.md)调查；不增加密度、白牌比例或先找到合格客户的硬门槛。电子市场名称本身不能证明穿戴集中。字段校验通过只证明结构，不证明写入的适配判断真实。
+
 每条商户采集entry用purpose=merchant_collection并带route_id，可附market_id但须与route一致；只能进入本批当前市场。六类未初查完、缺联系生态或preflight_city_id不是当前城市时，不能采商户。同市场内路线按有据大型→中型→小型安排，未知规模先核、仍未知单列；同市场内可并行。旧region_size_ladder仍按原路线顺序，但新默认不能借旧策略跨市场跳采。预研purpose只用于真实渠道调查，不能伪装采商户绕过顺序。
 
 路线进度用`route-progress --batch-id <ID> --route-id <ROUTE> --input <UPDATE.json>`。UPDATE包含state、detail、cursor（非空字符串，写实际页码/边界或无法取得游标的原因）、attempt_ids（字符串数组），state可active/complete/empty/blocked/skipped/deferred。complete/empty必须有实际商户采集尝试、directory_exhausted:true及明确的已发现目录边界；尚有未读/受阻条目不能标完。有发现商户的路线用complete，不写empty。受阻/跳过必须有真实尝试及next_trigger。暂缓使用deferred，另见下文；不能用一句“产出低”代替实际投入、缺口和替代路线依据。
@@ -56,11 +58,27 @@ market_sequence的计划还必须包含market_directory及preflight_city_id：
 python3 <SKILL_DIR>/scripts/leadkit_research.py market-progress --workspace <PROJECT> --batch-id <ID> --market-id <当前市场ID> --input <UPDATE.json>
 ```
 
-UPDATE只接受`state:"complete"`，另须detail、boundary、cursor、`directory_exhausted:true`、attempt_ids及source_ids。必须是当前市场，当前城市预研已完成；该市场全部已登记路线为complete／empty、没有未读或受阻入口；完成依据须来自该市场真实可读的边界尝试，attempt_ids和source_ids对应。脚本保留原进度和写入时间，completion_scope为observed_directory_boundary。
+登记完成时UPDATE使用`state:"complete"`，另须detail、boundary、cursor、`directory_exhausted:true`、attempt_ids及source_ids。必须是当前市场，当前城市预研已完成；该市场全部已登记路线为complete／empty、没有未读或受阻入口；完成依据须来自该市场真实可读的边界尝试，attempt_ids和source_ids对应。脚本保留原进度和写入时间，completion_scope为observed_directory_boundary。
 
 这个字段只证明所声明的目录边界已处理，不能自动证明全市场商户已列全。Codex必须核目录／分区边界确实足以支持用户要求的当前市场完整采集，才登记完成；若只读完有限搜索结果或目录不完整，保留未完成和真实限制，不用命令通过代替全场证据。
 
 当前市场完成后，本批停止新增商户采集，将当前结果合入统一客户总表；finish可用market_complete，下一次workflow continue才推进到next_market_id。当前市场未完成时，预算结束、受阻、暂缓或数量达标均继续保留该市场。同城可沿用有效预研，跨城preflight_city_id不符时须先更新渠道与联系生态。已列队列完成但目录未证完整时仍需扩展目录，不宣称全城／全国完成。
+
+有实际读取提示市场适配或可访问范围需复核时，同一命令可提交：
+
+```json
+{
+  "state": "review_required",
+  "detail": "实际已读内容、适配缺口与需要决定的范围；填写真实观察，不预填结论",
+  "boundary": "本轮实际抽查边界",
+  "cursor": "真实断点或下一入口",
+  "directory_exhausted": false,
+  "attempt_ids": ["本轮已登记的同市场实读尝试ID"],
+  "source_ids": ["该次实际读取支持判断的来源ID"]
+}
+```
+
+只允许当前未完成市场；须有本轮同市场route_reconnaissance／merchant_collection实读，source_ids全部被所引回执覆盖且含可读强证据。仅失败回执、其他市场或说明文字不足。状态返回needs_scope_review=true、active_market_complete=false、next_market_id=null；不自动should_stop，也不禁止同市场继续补查。需要阶段交接时再显式finish scope_review_required，保留completion_scope=partial及全部未读入口；新接续批不能复用旧review在零调查下再次以此结束。用户明确调整范围才另建调整任务，不重排旧目录绕过顺序。
 
 ## 逐次保存真实研究
 
@@ -97,7 +115,7 @@ mode=new/continue默认以new_qualified为目标，即本轮前主库不存在�
 python3 <SKILL_DIR>/scripts/leadkit_research.py finish --workspace <PROJECT> --batch-id <ID> --batch <PREPARED.json> --reason <REASON> --detail <真实说明>
 ```
 
-REASON为target_reached/coverage_complete/market_complete/attempt_budget/time_budget/paths_exhausted/access_blocked/needs_business_reply/user_stopped/batch_complete。target_reached仅适用target_or_coverage；coverage_complete须地图、目录范围及已发现路线确已处理；market_complete须当前市场有实际market-progress完成记录，不代表全城完成。预算须与实际计数一致；access_blocked须有真实失败且当前市场没有可执行路线／未读入口，不能用一个网站失败替整批收尾，更不能当作切换下一市场的许可。其他原因也须符合实际；新系统任务未完成时不可用batch_complete/paths_exhausted伪称完成。预检后目标不足不能写已达标。未提交的结束依据需要纠正时附`--revision-detail <修订原因>`，保留原结束历史且不重置起始时间。已提交记录冻结，另建接续批。
+REASON为target_reached/coverage_complete/market_complete/scope_review_required/attempt_budget/time_budget/paths_exhausted/access_blocked/needs_business_reply/user_stopped/batch_complete。target_reached仅适用target_or_coverage；coverage_complete须地图、目录范围及已发现路线确已处理；market_complete须当前市场有实际完成记录，不代表全城完成。scope_review_required须本轮当前市场真实review_required记录，可在预算上限前交接但不完成市场。预算须与实际计数一致；access_blocked须有真实失败且当前市场没有可执行路线／未读入口，不能用一个网站失败替整批收尾，更不能当作切换下一市场的许可。其他原因也须符合实际；新系统任务未完成时不可用batch_complete/paths_exhausted伪称完成。预检后目标不足不能写已达标。未提交的结束依据需要纠正时附`--revision-detail <修订原因>`，保留原结束历史且不重置起始时间。已提交记录冻结，另建接续批。
 
 commit保存摘要及日志hash；来源和执行明细在私有工作区，不进入开源技能包。渠道贡献包含同主体多渠道交叉，不能相加成总新增，也不作为成交率。没有账本的旧批兼容读取，但不编造历史进度。market_sequence及region_size_ladder任务必须有账本与真实结束记录，不能省略来绕过检查。所有“新增”计数相对该主库；另有外部历史库时须读取原件匹配，路径登记不等于跨库查重完成。
 

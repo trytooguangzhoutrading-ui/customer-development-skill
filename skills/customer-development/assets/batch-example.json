@@ -13,7 +13,7 @@
     "requirements": [
       "只交付真实读取后可归属的业务入口"
     ],
-    "allow_channel_candidates": false,
+    "allow_channel_candidates": true,
     "customer_profile": {
       "buyer_types": [
         "批发商",
